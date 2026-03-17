@@ -1,0 +1,23 @@
+. {
+    # Forward public DNS queries upstream
+    forward . 8.8.8.8 8.8.4.4
+
+    # etcd-backed service discovery for .mesh domain
+    etcd mesh {
+        stubzones
+        path /stratonmesh/dns
+        endpoint http://etcd:2379
+    }
+
+    # Expose Prometheus metrics
+    prometheus 0.0.0.0:9153
+
+    # Health endpoint
+    health 0.0.0.0:8080
+
+    # Log queries (disable in production)
+    log
+
+    errors
+    cache 30
+}

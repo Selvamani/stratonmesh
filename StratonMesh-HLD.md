@@ -21,34 +21,34 @@ The COL supports three import modes: **catalog** (parse metadata, images pre-bui
 ### 2.1 Seven-tier architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  Tier 1 — Client Interfaces                                      │
-│  CLI (stratonmesh) · Web Dashboard (Next.js) · Code-Server IDE  │
-│  Git webhooks · REST API (sm-api) · gRPC (proto-defined)        │
-├──────────────────────────────────────────────────────────────────┤
-│  Tier 2 — Catalog Onboarding Layer (COL)                        │
-│  Git importer · Format parsers · Blueprint catalog (etcd)       │
-│  Instantiation engine · Size profiles · AI import (Claude)      │
-├──────────────────────────────────────────────────────────────────┤
-│  Tier 3 — IaC Pipeline + GitOps                                 │
-│  7-stage pipeline · OPA policy gate · GitOps sync loop          │
-│  HMAC-SHA256 GitHub webhooks · GitLab token webhooks            │
-├──────────────────────────────────────────────────────────────────┤
-│  Tier 4 — Control Plane                                         │
-│  Stack orchestrator (state machine) · Scheduler (4-phase)       │
-│  Config manager (Vault + etcd) · Version ledger · Auto-scaler   │
-├──────────────────────────────────────────────────────────────────┤
-│  Tier 5 — Platform Adapter Layer                                │
-│  Docker · Compose · Kubernetes · Terraform · Pulumi · Process   │
-├──────────────────────────────────────────────────────────────────┤
-│  Tier 6 — Hybrid Service Mesh                                   │
-│  CoreDNS (Layer 1) · Service registry/etcd (Layer 2)           │
-│  Smart proxy + canary (Layer 3) · mTLS sidecar (Layer 4)       │
-├──────────────────────────────────────────────────────────────────┤
-│  Tier 7 — Observability                                         │
-│  NATS JetStream (telemetry bus) · VictoriaMetrics · Loki        │
-│  Grafana Tempo · Grafana dashboards · Auto-scaler               │
-└──────────────────────────────────────────────────────────────────┘
++--------------------------------------------------------------------+
+|  Tier 1 -- Client Interfaces                                       |
+|  CLI (stratonmesh)  Web Dashboard (Next.js)  Code-Server IDE       |
+|  Git webhooks  REST API (sm-api)  gRPC (proto-defined)             |
++--------------------------------------------------------------------+
+|  Tier 2 -- Catalog Onboarding Layer (COL)                          |
+|  Git importer  Format parsers  Blueprint catalog (etcd)            |
+|  Instantiation engine  Size profiles  AI import (Claude)           |
++--------------------------------------------------------------------+
+|  Tier 3 -- IaC Pipeline + GitOps                                   |
+|  7-stage pipeline  OPA policy gate  GitOps sync loop               |
+|  HMAC-SHA256 GitHub webhooks  GitLab token webhooks                |
++--------------------------------------------------------------------+
+|  Tier 4 -- Control Plane                                           |
+|  Stack orchestrator (state machine)  Scheduler (4-phase)           |
+|  Config manager (Vault + etcd)  Version ledger  Auto-scaler        |
++--------------------------------------------------------------------+
+|  Tier 5 -- Platform Adapter Layer                                  |
+|  Docker  Compose  Kubernetes  Terraform  Pulumi  Process           |
++--------------------------------------------------------------------+
+|  Tier 6 -- Hybrid Service Mesh                                     |
+|  CoreDNS (Layer 1)  Service registry/etcd (Layer 2)               |
+|  Smart proxy + canary (Layer 3)  mTLS sidecar (Layer 4, optional) |
++--------------------------------------------------------------------+
+|  Tier 7 -- Observability                                           |
+|  NATS JetStream (telemetry bus)  VictoriaMetrics  Promtail         |
+|  Loki  Grafana Tempo  Grafana dashboards  Auto-scaler              |
++--------------------------------------------------------------------+
 ```
 
 ### 2.2 Infrastructure layer
@@ -91,6 +91,11 @@ Single-node etcd and NATS for development (docker-compose.dev.yml). Production t
 | CI/CD pipeline | `.github/workflows/ci.yml` | ✅ |
 | Dev compose stack — etcd, NATS, Loki, Tempo, MinIO, CoreDNS | `deploy/` | ✅ |
 | Code-Server IDE integration | `deploy/docker-compose.dev.yml` | ✅ |
+| Prometheus `/metrics` endpoint on sm-agent (`:9091`) | `cmd/sm-agent` | ✅ |
+| VictoriaMetrics scrape config (all agents + controller + NATS) | `deploy/victoriametrics/` | ✅ |
+| Promtail Docker SD log shipping to Loki | `deploy/promtail/` | ✅ |
+| Grafana auto-provisioned datasources (VM, Loki, Tempo) | `deploy/grafana/provisioning/` | ✅ |
+| Grafana dashboards — Overview + Nodes | `deploy/grafana/provisioning/dashboards/` | ✅ |
 
 ### 3.2 Remaining / TODO
 
@@ -303,20 +308,98 @@ Self-signed ECDSA CA per cluster. SPIFFE URI SANs (`spiffe://stratonmesh/{stack}
 
 ### 9.1 Telemetry bus (NATS JetStream)
 
-Three durable streams: `METRICS` (4h retention), `LOGS` (24h), `TRACES` (1h with head-based sampling). All published by `pkg/telemetry` bus. Node agents publish real CPU/memory samples every 15 seconds.
+Three durable streams: `METRICS` (4h retention), `LOGS` (24h), `TRACES` (1h with head-based sampling). All published by `pkg/telemetry` bus. Node agents publish real CPU/memory samples every 15 seconds. NATS is used for **internal** event fan-out (auto-scaler, GitOps, pipeline events) — it is **not** the metrics source for VictoriaMetrics.
 
-### 9.2 Storage backends
+### 9.2 Metrics pipeline
 
-| System | Role |
-|--------|------|
-| VictoriaMetrics | Time-series metrics storage |
-| Grafana Loki | Structured log aggregation |
-| Grafana Tempo | Distributed trace storage |
-| Grafana | Unified dashboards and alerting |
+```
+sm-agent (gopsutil)
+    │
+    ├── NATS JetStream (telemetry.metrics.*)   ← internal: auto-scaler feedback
+    │
+    └── HTTP GET /metrics :9091                ← Prometheus exposition format
+              │
+              └── VictoriaMetrics scrape        ← promscrape.config prometheus.yml
+                        │
+                        └── Grafana dashboards  ← datasource: VictoriaMetrics
+```
 
-### 9.3 Node metrics
+`sm-agent` exposes a Prometheus `/metrics` endpoint on `:9091` using `prometheus/client_golang`. VictoriaMetrics is configured with `--promscrape.config` pointing at `deploy/victoriametrics/prometheus.yml`, which scrapes all three agent instances, the controller, and NATS.
 
-The `sm-agent` binary collects real host metrics via `gopsutil/v3`: CPU utilisation sampled over 200ms, available memory from `VirtualMemory().Available`. Heartbeats and metrics published every 10s and 15s respectively.
+**Exposed metrics:**
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `stratonmesh_node_cpu_percent` | Gauge | `node_id`, `node_name` | Host CPU usage % |
+| `stratonmesh_node_memory_percent` | Gauge | `node_id`, `node_name` | Host memory usage % |
+| `stratonmesh_node_info` | Gauge (=1) | `node_id`, `node_name`, `os`, `region` | Node registration info |
+| `stratonmesh_stack_state` | Gauge | `stack_name`, `state` | Stack lifecycle state |
+| `stratonmesh_pipeline_runs_total` | Counter | — | Total pipeline executions |
+| `stratonmesh_pipeline_stage_duration_ms` | Histogram | `stage` | Per-stage latency |
+| `stratonmesh_autoscaler_scale_up_total` | Counter | `service` | Scale-up events |
+| `stratonmesh_autoscaler_scale_down_total` | Counter | `service` | Scale-down events |
+| `stratonmesh_catalog_blueprints_total` | Gauge | — | Blueprints in catalog |
+
+### 9.3 Log pipeline
+
+```
+Docker container stdout/stderr
+    │
+    └── Promtail (Docker SD via /var/run/docker.sock)
+              │  relabel: service, compose_service, level, caller
+              │  pipeline: parse zap JSON, drop debug
+              │
+              └── Loki push API :3100
+                        │
+                        └── Grafana log panel  ← datasource: Loki
+```
+
+Promtail uses Docker service discovery (`docker_sd_configs`) to automatically tail all running containers. It parses structured zap JSON logs and promotes `level` and `caller` as indexed Loki labels. Debug-level logs are dropped at the pipeline stage to reduce storage.
+
+**Useful Loki label selectors:**
+
+| Selector | Returns |
+|----------|---------|
+| `{compose_service="sm-controller"}` | Controller logs |
+| `{compose_service=~"sm-agent.*"}` | All agent logs |
+| `{level="error"}` | Errors across all services |
+| `{compose_service="sm-controller", level="warn"}` | Controller warnings |
+
+### 9.4 Trace pipeline
+
+Grafana Tempo receives OTLP traces on `:4317` (gRPC) and `:4318` (HTTP). Tempo is linked to Loki in the Grafana datasource config (`tracesToLogsV2`) so trace spans can jump directly to correlated log lines by trace ID.
+
+### 9.5 Storage backends
+
+| System | Port | Role |
+|--------|------|------|
+| VictoriaMetrics | 8428 | Time-series metrics storage; Prometheus-compatible query API |
+| Grafana Loki | 3100 | Structured log aggregation; LogQL query language |
+| Grafana Tempo | 3200 | Distributed trace storage; OTLP ingest on 4317/4318 |
+| Grafana | 4000 | Unified dashboards, alerting, data source management |
+| Promtail | — | Log shipper; Docker SD → Loki push (no exposed port) |
+
+### 9.6 Grafana provisioning
+
+All Grafana configuration is provisioned automatically from `deploy/grafana/provisioning/` — no manual setup required after `docker compose up`:
+
+```
+deploy/grafana/provisioning/
+├── datasources/
+│   └── datasources.yaml       # VictoriaMetrics (default), Loki, Tempo — wired together
+└── dashboards/
+    ├── dashboards.yaml        # Provider: load from this directory, hot-reload every 30s
+    ├── stratonmesh-overview.json   # Stack health, node CPU/mem, pipeline latency, log tail
+    └── stratonmesh-nodes.json      # Per-node gauges, trends, heartbeat table; node variable
+```
+
+Grafana is configured with `GF_SERVER_HTTP_PORT=4000` (default 3000 would conflict with Next.js dashboard). Anonymous viewer access is enabled for the dev stack.
+
+### 9.7 Node metrics
+
+The `sm-agent` binary collects real host metrics via `gopsutil/v3`: CPU utilisation sampled over 200ms, available memory from `VirtualMemory().Available`. Two parallel publish paths run every 15 seconds:
+1. **NATS** — `telemetry.metrics.{nodeID}.` subjects consumed by the auto-scaler
+2. **Prometheus gauge** — updated in-process, scraped by VictoriaMetrics on `/metrics`
 
 ---
 
@@ -334,7 +417,17 @@ The `sm-agent` binary collects real host metrics via `gopsutil/v3`: CPU utilisat
 
 ### 10.2 Development stack (`deploy/docker-compose.dev.yml`)
 
-Services: etcd, NATS, Vault, VictoriaMetrics, Grafana, Loki, Tempo, MinIO, CoreDNS, Harbor (registry), Code-Server IDE, sm-controller, sm-api, sm-agent (× 3 nodes), Next.js dashboard.
+Services: etcd, NATS, Vault, VictoriaMetrics, Grafana, Loki, **Promtail**, Tempo, MinIO, CoreDNS, Harbor (registry), Code-Server IDE, sm-controller, sm-agent (× 3 nodes), Next.js dashboard.
+
+Config files auto-mounted at startup:
+
+| File | Mounted into | Purpose |
+|------|-------------|---------|
+| `deploy/victoriametrics/prometheus.yml` | VictoriaMetrics | Scrape targets for all sm-agent instances + controller + NATS |
+| `deploy/promtail/config.yml` | Promtail | Docker SD log collection → Loki |
+| `deploy/grafana/provisioning/datasources/` | Grafana | Auto-provision VictoriaMetrics, Loki, Tempo data sources |
+| `deploy/grafana/provisioning/dashboards/` | Grafana | Auto-provision Overview and Nodes dashboards |
+| `deploy/coredns/Corefile` | CoreDNS | etcd-backed DNS for service mesh |
 
 The Dockerfile uses a multi-stage build: Go 1.25 Alpine builder compiles all five binaries; the runtime image is Alpine 3.19 with `docker-cli`, `docker-cli-compose`, `git`, `ca-certificates`, and `curl`. `CMD` (not `ENTRYPOINT`) allows compose `command:` to select which binary runs.
 

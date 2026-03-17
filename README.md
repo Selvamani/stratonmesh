@@ -124,33 +124,33 @@ Produces four binaries in `bin/`:
 Seven tiers from client interfaces down to infrastructure:
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  Tier 1 — Client Interfaces                                          │
-│  CLI · Web Dashboard (Next.js) · Git webhooks · REST/gRPC API       │
-├──────────────────────────────────────────────────────────────────────┤
-│  Tier 2 — Catalog Onboarding Layer (COL)                            │
-│  Git importer · Format parsers · Blueprint catalog · AI import      │
-│  Size profiles (XS/S/M/L/XL) · Instantiation engine                │
-├──────────────────────────────────────────────────────────────────────┤
-│  Tier 3 — IaC Pipeline + GitOps                                     │
-│  7-stage pipeline · OPA policy gate · GitHub/GitLab webhooks        │
-├──────────────────────────────────────────────────────────────────────┤
-│  Tier 4 — Control Plane                                             │
-│  Orchestrator (state machine) · Scheduler (4-phase placement)       │
-│  Vault config manager · Version ledger · Auto-scaler               │
-├──────────────────────────────────────────────────────────────────────┤
-│  Tier 5 — Platform Adapter Layer                                    │
-│  Docker · Compose · Kubernetes · Terraform · Pulumi · Process       │
-│  OpenShift · Mesos/Marathon · Nomad · Swarm  [planned]             │
-├──────────────────────────────────────────────────────────────────────┤
-│  Tier 6 — Hybrid Service Mesh                                       │
-│  CoreDNS (L1) · Service registry/etcd (L2)                         │
-│  Smart proxy + canary (L3) · mTLS sidecar (L4, optional)           │
-├──────────────────────────────────────────────────────────────────────┤
-│  Tier 7 — Observability                                             │
-│  NATS JetStream · VictoriaMetrics · Loki · Grafana Tempo · Grafana  │
-└──────────────────────────────────────────────────────────────────────┘
-                Infrastructure: etcd · NATS · Harbor · MinIO · Vault
++------------------------------------------------------------------------+
+|  Tier 1 -- Client Interfaces                                           |
+|  CLI  Web Dashboard (Next.js)  Git webhooks  REST/gRPC API            |
++------------------------------------------------------------------------+
+|  Tier 2 -- Catalog Onboarding Layer (COL)                              |
+|  Git importer  Format parsers  Blueprint catalog  AI import (Claude)  |
+|  Size profiles (XS/S/M/L/XL)  Instantiation engine                   |
++------------------------------------------------------------------------+
+|  Tier 3 -- IaC Pipeline + GitOps                                       |
+|  7-stage pipeline  OPA policy gate  GitHub/GitLab webhooks            |
++------------------------------------------------------------------------+
+|  Tier 4 -- Control Plane                                               |
+|  Orchestrator (state machine)  Scheduler (4-phase placement)          |
+|  Vault config manager  Version ledger  Auto-scaler                    |
++------------------------------------------------------------------------+
+|  Tier 5 -- Platform Adapter Layer                                      |
+|  Docker  Compose  Kubernetes  Terraform  Pulumi  Process              |
+|  OpenShift  Mesos/Marathon  Nomad  Swarm  [planned]                   |
++------------------------------------------------------------------------+
+|  Tier 6 -- Hybrid Service Mesh                                         |
+|  CoreDNS (L1)  Service registry/etcd (L2)                             |
+|  Smart proxy + canary (L3)  mTLS sidecar (L4, optional)              |
++------------------------------------------------------------------------+
+|  Tier 7 -- Observability                                               |
+|  NATS JetStream  VictoriaMetrics  Promtail  Loki  Tempo  Grafana      |
++------------------------------------------------------------------------+
+             Infrastructure: etcd  NATS  Harbor  MinIO  Vault
 ```
 
 ---
@@ -236,8 +236,15 @@ stratonmesh/
 │   ├── mailu/stack.yaml     # Full Mailu email suite (7 services)
 │   └── nextcloud/stack.yaml # Nextcloud + PostgreSQL + Redis (7 services)
 ├── deploy/
-│   ├── Dockerfile           # Multi-stage controller image
-│   └── docker-compose.dev.yml  # Full dev stack: etcd, NATS, Vault, Loki, Grafana
+│   ├── Dockerfile                    # Multi-stage controller image
+│   ├── docker-compose.dev.yml        # Full dev stack
+│   ├── victoriametrics/
+│   │   └── prometheus.yml            # Scrape config: sm-agent × 3, controller, NATS
+│   ├── promtail/
+│   │   └── config.yml                # Docker SD → Loki log shipping
+│   └── grafana/provisioning/
+│       ├── datasources/              # Auto-provision: VictoriaMetrics, Loki, Tempo
+│       └── dashboards/               # Auto-provision: Overview + Nodes dashboards
 └── test/
     ├── integration/         # Integration tests (etcd + NATS required)
     └── e2e/                 # End-to-end tests
@@ -272,6 +279,56 @@ Full gRPC definitions: [`api/proto/stratonmesh.proto`](api/proto/stratonmesh.pro
 
 ---
 
+## Observability
+
+The full dev stack ships a working observability pipeline out of the box — no manual Grafana setup required.
+
+### Metrics
+
+`sm-agent` exposes a Prometheus `/metrics` endpoint on `:9091`. VictoriaMetrics scrapes all agent instances, the controller, and NATS every 15 seconds via [`deploy/victoriametrics/prometheus.yml`](deploy/victoriametrics/prometheus.yml).
+
+```
+sm-agent :9091/metrics  ──┐
+sm-agent-node2 :9091    ──┤──► VictoriaMetrics :8428 ──► Grafana :4000
+sm-agent-node3 :9091    ──┘
+sm-controller :8080/metrics
+```
+
+Key metrics: `stratonmesh_node_cpu_percent`, `stratonmesh_node_memory_percent`, `stratonmesh_node_info`, `stratonmesh_stack_state`, `stratonmesh_pipeline_runs_total`, `stratonmesh_autoscaler_scale_up_total`.
+
+### Logs
+
+Promtail uses Docker service discovery to automatically tail all running container logs and ship them to Loki. Structured zap JSON is parsed — `level` and `caller` become indexed Loki labels. Debug logs are filtered out by default.
+
+```
+Docker containers (stdout/stderr)
+    └──► Promtail (Docker SD) ──► Loki :3100 ──► Grafana :4000
+```
+
+Query examples in Grafana Explore:
+```logql
+{compose_service="sm-controller"}               # controller logs
+{compose_service=~"sm-agent.*", level="error"}  # agent errors
+{level="error"} |= "etcd"                       # etcd errors anywhere
+```
+
+### Dashboards
+
+Two dashboards are auto-provisioned at startup:
+
+| Dashboard | URL | Contents |
+|-----------|-----|----------|
+| **StratonMesh — Overview** | http://localhost:4000/d/stratonmesh-overview | Stack health stats, node CPU/mem, pipeline latency p95, auto-scaler events, live log tail |
+| **StratonMesh — Nodes** | http://localhost:4000/d/stratonmesh-nodes | Per-node CPU/mem/disk gauges, trends over time, heartbeat table; filterable by node |
+
+Login: `admin` / `admin` (anonymous viewer also enabled).
+
+### Traces
+
+Grafana Tempo receives OTLP traces on `:4317` (gRPC) and `:4318` (HTTP). Correlated log→trace navigation is configured — click a trace ID in Loki to jump directly to the span in Tempo.
+
+---
+
 ## Configuration
 
 Key environment variables:
@@ -285,6 +342,7 @@ Key environment variables:
 | `SM_VAULT_SECRET_ID` | — | Vault AppRole secret ID |
 | `SM_API_PORT` | `8080` | REST API listen port |
 | `SM_NODE_NAME` | hostname | Node identity in the scheduler |
+| `SM_METRICS_ADDR` | `:9091` | Prometheus `/metrics` listen address (sm-agent) |
 | `SM_LOG_LEVEL` | `info` | Log level: debug / info / warn / error |
 
 ---

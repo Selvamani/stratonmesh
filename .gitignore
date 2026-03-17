@@ -3,9 +3,6 @@ coverage.out
 *.test
 .env
 vendor/
-deploy/coredns/
-deploy/grafana/
 deploy/repos/
-deploy/tempo/
 web/.next/
 web/node_modules/

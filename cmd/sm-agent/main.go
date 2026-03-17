@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/stratonmesh/stratonmesh/internal/logger"
@@ -31,6 +35,36 @@ func main() {
 
 	nodeID   := envOr("SM_NODE_ID", hostname())
 	nodeName := envOr("SM_NODE_NAME", hostname())
+
+	// Prometheus metrics — scraped by VictoriaMetrics
+	labels := prometheus.Labels{"node_id": nodeID, "node_name": nodeName}
+	cpuGauge := promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "stratonmesh_node_cpu_percent",
+		Help: "Node CPU usage percentage",
+	}, []string{"node_id", "node_name"}).With(labels)
+	memGauge := promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "stratonmesh_node_memory_percent",
+		Help: "Node memory usage percentage",
+	}, []string{"node_id", "node_name"}).With(labels)
+	nodeInfo := promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "stratonmesh_node_info",
+		Help: "Node registration info (value always 1)",
+	}, []string{"node_id", "node_name", "os", "region"}).With(prometheus.Labels{
+		"node_id": nodeID, "node_name": nodeName,
+		"os": runtime.GOOS, "region": envOr("SM_REGION", "local"),
+	})
+	nodeInfo.Set(1)
+
+	metricsAddr := envOr("SM_METRICS_ADDR", ":9091")
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", promhttp.Handler())
+	metricsSrv := &http.Server{Addr: metricsAddr, Handler: metricsMux}
+	go func() {
+		log.Infow("metrics endpoint listening", "addr", metricsAddr)
+		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Warnw("metrics server error", "error", err)
+		}
+	}()
 
 	register := func() {
 		cpuTotal, cpuFree := cpuMillicores()
@@ -60,30 +94,35 @@ func main() {
 		}}
 	}()
 
-	// Publish real metrics every 15 s.
-	if bus != nil {
-		go func() {
-			for { select {
-			case <-time.After(15 * time.Second):
-				cpuTotal, cpuFree := cpuMillicores()
-				memTotal, memFree := memBytes()
-				cpuUsedPct := 0.0
-				if cpuTotal > 0 {
-					cpuUsedPct = float64(cpuTotal-cpuFree) / float64(cpuTotal) * 100
-				}
-				memUsedPct := 0.0
-				if memTotal > 0 {
-					memUsedPct = float64(memTotal-memFree) / float64(memTotal) * 100
-				}
+	// Collect and publish metrics every 15 s — to both NATS and Prometheus gauges.
+	go func() {
+		for { select {
+		case <-time.After(15 * time.Second):
+			cpuTotal, cpuFree := cpuMillicores()
+			memTotal, memFree := memBytes()
+			cpuUsedPct := 0.0
+			if cpuTotal > 0 {
+				cpuUsedPct = float64(cpuTotal-cpuFree) / float64(cpuTotal) * 100
+			}
+			memUsedPct := 0.0
+			if memTotal > 0 {
+				memUsedPct = float64(memTotal-memFree) / float64(memTotal) * 100
+			}
+			cpuGauge.Set(cpuUsedPct)
+			memGauge.Set(memUsedPct)
+			if bus != nil {
 				bus.PublishMetric(ctx, telemetry.MetricPoint{Node: nodeID, Name: "cpu",    Value: cpuUsedPct, Unit: "percent"})
 				bus.PublishMetric(ctx, telemetry.MetricPoint{Node: nodeID, Name: "memory", Value: memUsedPct, Unit: "percent"})
-			case <-ctx.Done(): return
-			}}
-		}()
-	}
+			}
+		case <-ctx.Done(): return
+		}}
+	}()
 
 	log.Infow("agent running", "node", nodeID, "os", runtime.GOOS)
 	<-ctx.Done()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	metricsSrv.Shutdown(shutdownCtx)
 }
 
 // cpuMillicores returns total and free CPU in millicores using real host metrics.
