@@ -1,0 +1,146 @@
+stack:
+  name: mailu
+  version: "2024.06"
+  platform: docker
+  environment: production
+
+  strategy:
+    type: rolling
+    maxUnavailable: 1
+    healthCheckTimeout: 120s
+    rollbackOnFailure: true
+
+  variables:
+    domain: "mail.acme.com"
+    version: "2024.06"
+
+  services:
+    - name: front
+      type: long-running
+      image: "mailu/nginx:${version}"
+      replicas: 2
+      ports:
+        - expose: 80
+        - expose: 443
+        - expose: 25
+        - expose: 465
+        - expose: 993
+      env:
+        TLS_FLAVOR: letsencrypt
+        DOMAIN: "${domain}"
+      resources:
+        cpu: 500m
+        memory: 256Mi
+      healthCheck:
+        liveness:
+          http: /health
+          interval: 10s
+      scaling:
+        auto: true
+        minReplicas: 1
+        maxReplicas: 4
+        metrics:
+          - type: cpu
+            target: "70%"
+
+    - name: imap
+      type: stateful
+      image: "mailu/dovecot:${version}"
+      replicas: 1
+      volumes:
+        - name: maildata
+          size: 100Gi
+          mountAt: /mail
+          bindTo: instance
+          snapshot: true
+      env:
+        DOMAIN: "${domain}"
+      resources:
+        cpu: 1000m
+        memory: 512Mi
+      healthCheck:
+        custom:
+          exec: "doveadm service status"
+      scaling:
+        auto: true
+        minReplicas: 1
+        maxReplicas: 3
+      dependsOn: [redis]
+
+    - name: smtp
+      type: long-running
+      image: "mailu/postfix:${version}"
+      replicas: 1
+      ports:
+        - expose: 25
+      env:
+        DOMAIN: "${domain}"
+      resources:
+        cpu: 500m
+        memory: 256Mi
+      scaling:
+        auto: true
+        minReplicas: 1
+        maxReplicas: 3
+        metrics:
+          - type: custom
+            target: "queue_length:100"
+      dependsOn: [redis, antispam]
+
+    - name: antispam
+      type: long-running
+      image: "mailu/rspamd:${version}"
+      replicas: 1
+      resources:
+        cpu: 500m
+        memory: 512Mi
+      dependsOn: [redis]
+
+    - name: webmail
+      type: long-running
+      image: "mailu/roundcube:${version}"
+      replicas: 2
+      ports:
+        - expose: 80
+      resources:
+        cpu: 500m
+        memory: 256Mi
+      healthCheck:
+        liveness:
+          http: /
+      scaling:
+        auto: true
+        minReplicas: 1
+        maxReplicas: 5
+        metrics:
+          - type: cpu
+            target: "70%"
+      dependsOn: [imap, smtp]
+
+    - name: admin
+      type: long-running
+      image: "mailu/admin:${version}"
+      replicas: 1
+      ports:
+        - expose: 80
+      env:
+        DOMAIN: "${domain}"
+      resources:
+        cpu: 250m
+        memory: 256Mi
+      dependsOn: [redis]
+
+    - name: redis
+      type: stateful
+      image: "redis:7-alpine"
+      replicas: 1
+      volumes:
+        - name: redis-data
+          size: 1Gi
+          mountAt: /data
+      resources:
+        cpu: 250m
+        memory: 128Mi
+      healthCheck:
+        liveness:
+          exec: "redis-cli ping"

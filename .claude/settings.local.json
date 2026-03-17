@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go mod:*)",
+      "Bash(go list:*)",
+      "Bash(GOPROXY=https://proxy.golang.org go list -m -versions github.com/shirou/gopsutil/v3)",
+      "Bash(GOPROXY=direct go list -m -versions github.com/shirou/gopsutil/v3)",
+      "Bash(go build:*)"
+    ]
+  }
+}

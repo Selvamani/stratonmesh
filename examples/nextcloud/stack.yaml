@@ -1,0 +1,185 @@
+stack:
+  name: nextcloud
+  version: "29.0"
+  platform: docker
+  environment: production
+
+  strategy:
+    type: rolling
+    maxUnavailable: 1
+    healthCheckTimeout: 180s
+    rollbackOnFailure: true
+
+  variables:
+    domain: "cloud.acme.com"
+    nc_version: "29"
+
+  services:
+    - name: app
+      type: long-running
+      image: "nextcloud:${nc_version}-apache"
+      replicas: 4
+      ports:
+        - expose: 80
+      env:
+        NEXTCLOUD_ADMIN_USER: admin
+        NEXTCLOUD_ADMIN_PASSWORD: "vault:secret/nextcloud#admin_password"
+        POSTGRES_HOST: "postgres.nextcloud.prod.mesh.local"
+        POSTGRES_DB: nextcloud
+        POSTGRES_USER: nextcloud
+        POSTGRES_PASSWORD: "vault:secret/nextcloud#db_password"
+        REDIS_HOST: "redis.nextcloud.prod.mesh.local"
+        NEXTCLOUD_TRUSTED_DOMAINS: "${domain}"
+        OBJECTSTORE_S3_HOST: "minio.nextcloud.prod.mesh.local"
+        OBJECTSTORE_S3_PORT: "9000"
+        OBJECTSTORE_S3_BUCKET: nextcloud
+        OBJECTSTORE_S3_KEY: "vault:secret/nextcloud#minio_key"
+        OBJECTSTORE_S3_SECRET: "vault:secret/nextcloud#minio_secret"
+      volumes:
+        - name: nc-data
+          size: 2Ti
+          mountAt: /var/www/html
+          shared: true
+      resources:
+        cpu: 2000m
+        memory: 2Gi
+      healthCheck:
+        liveness:
+          http: /status.php
+          interval: 15s
+          timeout: 5s
+        readiness:
+          http: /status.php
+          interval: 5s
+      scaling:
+        auto: true
+        minReplicas: 2
+        maxReplicas: 12
+        metrics:
+          - type: cpu
+            target: "70%"
+          - type: requestRate
+            target: "500/s"
+      affinity:
+        spread: node
+        colocate: [redis]
+      dependsOn: [postgres, redis, minio]
+      mesh:
+        sidecar: true
+
+    - name: postgres
+      type: stateful
+      image: "postgres:16"
+      identity: ordinal
+      replicas: 2
+      volumes:
+        - name: pgdata
+          size: 200Gi
+          mountAt: /var/lib/postgresql/data
+          bindTo: instance
+          snapshot: true
+      env:
+        POSTGRES_DB: nextcloud
+        POSTGRES_USER: nextcloud
+        POSTGRES_PASSWORD: "vault:secret/nextcloud#db_password"
+      resources:
+        cpu: 2000m
+        memory: 4Gi
+      healthCheck:
+        custom:
+          exec: "pg_isready -U nextcloud"
+      lifecycle:
+        postStart: "/scripts/init-replica.sh"
+        preStop: "/scripts/drain-connections.sh"
+      backup:
+        schedule: "0 */6 * * *"
+        retention: 7d
+      affinity:
+        spread: zone
+
+    - name: redis
+      type: stateful
+      image: "redis:7-alpine"
+      replicas: 1
+      volumes:
+        - name: redis-data
+          size: 2Gi
+          mountAt: /data
+      resources:
+        cpu: 500m
+        memory: 512Mi
+      healthCheck:
+        liveness:
+          exec: "redis-cli ping"
+
+    - name: minio
+      type: stateful
+      image: "minio/minio"
+      replicas: 1
+      ports:
+        - expose: 9000
+        - expose: 9001
+      volumes:
+        - name: object-store
+          size: 2Ti
+          mountAt: /data
+          snapshot: true
+      env:
+        MINIO_ROOT_USER: "vault:secret/nextcloud#minio_key"
+        MINIO_ROOT_PASSWORD: "vault:secret/nextcloud#minio_secret"
+      resources:
+        cpu: 1000m
+        memory: 1Gi
+      healthCheck:
+        liveness:
+          http: /minio/health/live
+      backup:
+        schedule: "0 2 * * *"
+        retention: 14d
+
+    - name: cron
+      type: scheduled
+      image: "nextcloud:${nc_version}-apache"
+      schedule: "*/5 * * * *"
+      command: "php /var/www/html/cron.php"
+      resources:
+        cpu: 500m
+        memory: 512Mi
+      dependsOn: [app, postgres, redis]
+
+    - name: preview-gen
+      type: batch
+      image: "nextcloud:${nc_version}-apache"
+      schedule: "0 2 * * *"
+      command: "php /var/www/html/occ preview:generate-all"
+      timeout: 4h
+      retries: 2
+      resources:
+        cpu: 2000m
+        memory: 2Gi
+      dependsOn: [app, postgres]
+
+    - name: collabora
+      type: long-running
+      image: "collabora/code"
+      replicas: 2
+      ports:
+        - expose: 9980
+      env:
+        domain: "${domain}"
+        extra_params: "--o:ssl.enable=false"
+      resources:
+        cpu: 2000m
+        memory: 4Gi
+      healthCheck:
+        liveness:
+          http: /
+      scaling:
+        auto: true
+        minReplicas: 1
+        maxReplicas: 4
+        metrics:
+          - type: cpu
+            target: "70%"
+      affinity:
+        spread: node

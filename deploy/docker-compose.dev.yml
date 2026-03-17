@@ -1,0 +1,312 @@
+# StratonMesh local development stack
+# Required: etcd, nats
+# Optional: everything else (start incrementally)
+#
+# Quick start (required only):
+#   docker compose -f deploy/docker-compose.dev.yml up -d etcd nats
+#
+# Full observability stack:
+#   docker compose -f deploy/docker-compose.dev.yml up -d
+
+services:
+
+  # ── Required ────────────────────────────────────────────────────────────────
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.12
+    command:
+      - /usr/local/bin/etcd
+      - --name=default
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://0.0.0.0:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://0.0.0.0:2380
+      - --initial-cluster=default=http://0.0.0.0:2380
+      - --initial-cluster-state=new
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    volumes:
+      - etcd-data:/etcd-data
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-m", "8222", "--name", "stratonmesh-dev"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"  # monitoring HTTP
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── StratonMesh services ─────────────────────────────────────────────────────
+
+  sm-controller:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["/bin/sm-controller"]
+    environment:
+      SM_ETCD: etcd:2379
+      SM_NATS: nats://nats:4222
+      SM_API_ADDR: :8080
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./repos:/var/lib/stratonmesh/repos
+    depends_on:
+      etcd:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/v1/nodes"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  sm-agent:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["/bin/sm-agent"]
+    environment:
+      SM_ETCD: etcd:2379
+      SM_NATS: nats://nats:4222
+      SM_NODE_ID: local-host
+      SM_NODE_NAME: "${HOSTNAME:-local-host}"
+      SM_REGION: local
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      etcd:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  sm-agent-node2:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["/bin/sm-agent"]
+    environment:
+      SM_ETCD: etcd:2379
+      SM_NATS: nats://nats:4222
+      SM_NODE_ID: node-2
+      SM_NODE_NAME: node-2
+      SM_REGION: us-east
+    depends_on:
+      etcd:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  sm-agent-node3:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["/bin/sm-agent"]
+    environment:
+      SM_ETCD: etcd:2379
+      SM_NATS: nats://nats:4222
+      SM_NODE_ID: node-3
+      SM_NODE_NAME: node-3
+      SM_REGION: eu-west
+    depends_on:
+      etcd:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  dashboard:
+    build:
+      context: ../web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_VERSION: ${VERSION:-dev}
+        SM_API_URL: http://sm-controller:8080
+    environment:
+      SM_API_URL: http://sm-api:8080
+      PORT: 3001
+    ports:
+      - "3001:3001"
+    depends_on:
+      sm-controller:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3001"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Secrets management ──────────────────────────────────────────────────────
+
+  vault:
+    image: hashicorp/vault:1.15
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: dev-token
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    ports:
+      - "8200:8200"
+    cap_add:
+      - IPC_LOCK
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Service mesh DNS ─────────────────────────────────────────────────────────
+
+  coredns:
+    image: coredns/coredns:1.11.1
+    command: ["-conf", "/etc/coredns/Corefile"]
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "9153:9153"  # metrics
+    volumes:
+      - ./coredns/Corefile:/etc/coredns/Corefile:ro
+    depends_on:
+      etcd:
+        condition: service_healthy
+
+  # ── Metrics ─────────────────────────────────────────────────────────────────
+
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.99.0
+    command:
+      - --storageDataPath=/victoria-metrics-data
+      - --retentionPeriod=30d
+      - --httpListenAddr=:8428
+    ports:
+      - "8428:8428"
+    volumes:
+      - vm-data:/victoria-metrics-data
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8428/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Logs ────────────────────────────────────────────────────────────────────
+
+  loki:
+    image: grafana/loki:2.9.4
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki-data:/loki
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3100/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  # ── Traces ──────────────────────────────────────────────────────────────────
+
+  tempo:
+    image: grafana/tempo:2.4.1
+    command: ["-config.file=/etc/tempo.yaml"]
+    ports:
+      - "3200:3200"   # tempo HTTP
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    volumes:
+      - tempo-data:/tmp/tempo
+      - ./tempo/tempo.yaml:/etc/tempo.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3200/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  # ── Dashboards ──────────────────────────────────────────────────────────────
+
+  grafana:
+    image: grafana/grafana:10.3.3
+    ports:
+      - "4000:4000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - victoriametrics
+      - loki
+      - tempo
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:4000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  # ── Object storage (snapshots & artifacts) ───────────────────────────────────
+
+  minio:
+    image: minio/minio:RELEASE.2024-03-10T02-53-48Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: stratonmesh
+      MINIO_ROOT_PASSWORD: stratonmesh123
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Browser IDE (code-server) ─────────────────────────────────────────────────
+
+  code-server:
+    image: codercom/code-server:4.23.1
+    ports:
+      - "8443:8080"
+    environment:
+      PASSWORD: stratonmesh
+    volumes:
+      - ./repos:/home/coder/repos
+    command: ["--auth", "password", "--bind-addr", "0.0.0.0:8080", "/home/coder/repos"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Container registry ────────────────────────────────────────────────────────
+
+  registry:
+    image: registry:2.8
+    ports:
+      - "5000:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+    environment:
+      REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /var/lib/registry
+
+volumes:
+  etcd-data:
+  vm-data:
+  grafana-data:
+  loki-data:
+  tempo-data:
+  minio-data:
+  registry-data:

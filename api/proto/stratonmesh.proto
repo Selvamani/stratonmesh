@@ -1,0 +1,353 @@
+syntax = "proto3";
+
+package stratonmesh.v1;
+
+option go_package = "github.com/stratonmesh/stratonmesh/api/gen/stratonmesh/v1;stratonmeshv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+import "google/api/annotations.proto";
+
+// ─── Stack Service ─────────────────────────────────────────────────────────────
+
+// StackService manages the full lifecycle of deployed stacks.
+service StackService {
+  // Deploy submits a manifest and triggers the IaC pipeline.
+  rpc Deploy(DeployRequest) returns (DeployResponse) {
+    option (google.api.http) = {
+      post: "/v1/stacks"
+      body: "*"
+    };
+  }
+
+  // Scale updates the replica count for a service within a running stack.
+  rpc Scale(ScaleRequest) returns (ScaleResponse) {
+    option (google.api.http) = {
+      post: "/v1/stacks/{stack_id}/scale"
+      body: "*"
+    };
+  }
+
+  // Destroy tears down a stack and all its resources.
+  rpc Destroy(DestroyRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      delete: "/v1/stacks/{stack_id}"
+    };
+  }
+
+  // Status returns the current state of a stack.
+  rpc Status(StatusRequest) returns (StatusResponse) {
+    option (google.api.http) = {
+      get: "/v1/stacks/{stack_id}"
+    };
+  }
+
+  // List returns all stacks and their current states.
+  rpc List(ListStacksRequest) returns (ListStacksResponse) {
+    option (google.api.http) = {
+      get: "/v1/stacks"
+    };
+  }
+
+  // Rollback reverts a stack to its previous version.
+  rpc Rollback(RollbackRequest) returns (RollbackResponse) {
+    option (google.api.http) = {
+      post: "/v1/stacks/{stack_id}/rollback"
+      body: "*"
+    };
+  }
+
+  // Ledger returns the deployment history for a stack.
+  rpc Ledger(LedgerRequest) returns (LedgerResponse) {
+    option (google.api.http) = {
+      get: "/v1/stacks/{stack_id}/ledger"
+    };
+  }
+
+  // Watch streams real-time state-change events for a stack.
+  rpc Watch(WatchRequest) returns (stream StackEvent) {
+    option (google.api.http) = {
+      get: "/v1/stacks/{stack_id}/watch"
+    };
+  }
+}
+
+// ─── Catalog Service ───────────────────────────────────────────────────────────
+
+// CatalogService manages the blueprint catalog (Catalog Onboarding Layer).
+service CatalogService {
+  // Import clones a Git repository and creates a blueprint in the catalog.
+  rpc Import(ImportRequest) returns (ImportResponse) {
+    option (google.api.http) = {
+      post: "/v1/catalog"
+      body: "*"
+    };
+  }
+
+  // Get retrieves a single blueprint by name.
+  rpc Get(GetBlueprintRequest) returns (Blueprint) {
+    option (google.api.http) = {
+      get: "/v1/catalog/{name}"
+    };
+  }
+
+  // List returns all blueprints in the catalog.
+  rpc ListBlueprints(ListBlueprintsRequest) returns (ListBlueprintsResponse) {
+    option (google.api.http) = {
+      get: "/v1/catalog"
+    };
+  }
+
+  // Instantiate creates a ready-to-deploy Stack from a blueprint + size profile.
+  rpc Instantiate(InstantiateRequest) returns (InstantiateResponse) {
+    option (google.api.http) = {
+      post: "/v1/catalog/{blueprint_name}/instantiate"
+      body: "*"
+    };
+  }
+}
+
+// ─── Node Service ──────────────────────────────────────────────────────────────
+
+// NodeService exposes the cluster node inventory.
+service NodeService {
+  // ListNodes returns all registered cluster nodes.
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse) {
+    option (google.api.http) = {
+      get: "/v1/nodes"
+    };
+  }
+
+  // GetNode returns details for a specific node.
+  rpc GetNode(GetNodeRequest) returns (Node) {
+    option (google.api.http) = {
+      get: "/v1/nodes/{node_id}"
+    };
+  }
+
+  // WatchNodes streams node registration and heartbeat events.
+  rpc WatchNodes(google.protobuf.Empty) returns (stream NodeEvent) {}
+}
+
+// ─── Messages ──────────────────────────────────────────────────────────────────
+
+message DeployRequest {
+  // manifest_yaml is the raw YAML of the Stack manifest.
+  string manifest_yaml = 1;
+  // platform overrides the platform field in the manifest.
+  string platform = 2;
+  // environment overrides the environment field.
+  string environment = 3;
+  // variables are key=value overrides applied at interpolation time.
+  map<string, string> variables = 4;
+  // dry_run runs all pipeline stages except the final apply.
+  bool dry_run = 5;
+}
+
+message DeployResponse {
+  string stack_id   = 1;
+  string pipeline_id = 2;
+  string status     = 3;
+  repeated StageResult stages = 4;
+}
+
+message StageResult {
+  string name     = 1;
+  string status   = 2;  // passed, failed, skipped
+  string message  = 3;
+  int64  duration_ms = 4;
+}
+
+message ScaleRequest {
+  string stack_id = 1;
+  string service  = 2;
+  int32  replicas = 3;
+}
+
+message ScaleResponse {
+  string stack_id = 1;
+  string service  = 2;
+  int32  replicas = 3;
+}
+
+message DestroyRequest {
+  string stack_id = 1;
+  bool   force    = 2;
+}
+
+message StatusRequest {
+  string stack_id = 1;
+}
+
+message StatusResponse {
+  string stack_id    = 1;
+  string status      = 2;  // pending, deploying, running, failed, stopped, …
+  string version     = 3;
+  string platform    = 4;
+  string environment = 5;
+  repeated ServiceStatus services = 6;
+  google.protobuf.Timestamp last_updated = 7;
+}
+
+message ServiceStatus {
+  string name     = 1;
+  int32  replicas = 2;
+  int32  ready    = 3;
+  string health   = 4;  // healthy, unhealthy, unknown
+}
+
+message ListStacksRequest {
+  string status_filter = 1;  // optional: "running", "failed", etc.
+}
+
+message ListStacksResponse {
+  repeated StackSummary stacks = 1;
+}
+
+message StackSummary {
+  string stack_id    = 1;
+  string status      = 2;
+  string version     = 3;
+  string environment = 4;
+  string platform    = 5;
+}
+
+message RollbackRequest {
+  string stack_id      = 1;
+  string target_version = 2;  // empty = previous version
+}
+
+message RollbackResponse {
+  string stack_id      = 1;
+  string target_version = 2;
+  string status        = 3;
+}
+
+message LedgerRequest {
+  string stack_id = 1;
+  int32  limit    = 2;  // default 20
+}
+
+message LedgerResponse {
+  string stack_id = 1;
+  repeated LedgerEntry entries = 2;
+}
+
+message LedgerEntry {
+  string stack_id    = 1;
+  string version     = 2;
+  string deployed_by = 3;
+  string git_sha     = 4;
+  string pipeline_id = 5;
+  google.protobuf.Timestamp deployed_at = 6;
+}
+
+message WatchRequest {
+  string stack_id = 1;
+}
+
+message StackEvent {
+  string stack_id  = 1;
+  string event_type = 2;  // state_change, health_change, scale
+  string old_state  = 3;
+  string new_state  = 4;
+  string message    = 5;
+  google.protobuf.Timestamp timestamp = 6;
+}
+
+// ─── Catalog messages ──────────────────────────────────────────────────────────
+
+message ImportRequest {
+  string git_url  = 1;
+  string branch   = 2;
+  string tag      = 3;
+  string path     = 4;
+  string name     = 5;
+  string ssh_key  = 6;
+}
+
+message ImportResponse {
+  Blueprint blueprint = 1;
+  string    format    = 2;  // docker-compose, helm, kubernetes, terraform
+  int32     services  = 3;
+  int32     volumes   = 4;
+}
+
+message Blueprint {
+  string name        = 1;
+  string version     = 2;
+  string source      = 3;
+  string git_url     = 4;
+  string git_branch  = 5;
+  string git_sha     = 6;
+  string category    = 7;
+  string description = 8;
+  map<string, string> parameters = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+message GetBlueprintRequest {
+  string name = 1;
+}
+
+message ListBlueprintsRequest {
+  string category = 1;  // optional filter
+}
+
+message ListBlueprintsResponse {
+  repeated Blueprint blueprints = 1;
+}
+
+message InstantiateRequest {
+  string blueprint_name = 1;
+  string instance_name  = 2;
+  string size           = 3;  // XS, S, M, L, XL
+  string platform       = 4;
+  string environment    = 5;
+  map<string, string> parameters = 6;
+}
+
+message InstantiateResponse {
+  string manifest_yaml = 1;  // the resolved Stack manifest ready to Deploy
+  string blueprint_name = 2;
+  string size           = 3;
+  int32  service_count  = 4;
+}
+
+// ─── Node messages ─────────────────────────────────────────────────────────────
+
+message ListNodesRequest {}
+
+message ListNodesResponse {
+  repeated Node nodes = 1;
+}
+
+message GetNodeRequest {
+  string node_id = 1;
+}
+
+message Node {
+  string node_id   = 1;
+  string name      = 2;
+  string os        = 3;
+  string region    = 4;
+  string status    = 5;  // healthy, unhealthy
+  repeated string providers = 6;
+  int64  cpu_total = 7;   // millicores
+  int64  cpu_free  = 8;
+  int64  mem_total = 9;   // bytes
+  int64  mem_free  = 10;
+  int32  gpu_total = 11;
+  int32  gpu_free  = 12;
+  double cost_per_hr = 13;
+  map<string, string> labels = 14;
+  google.protobuf.Timestamp last_seen = 15;
+}
+
+message NodeEvent {
+  string node_id    = 1;
+  string event_type = 2;  // registered, heartbeat, unregistered, unhealthy
+  Node   node       = 3;
+  google.protobuf.Timestamp timestamp = 4;
+}
