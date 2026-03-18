@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/stratonmesh/stratonmesh/pkg/manifest"
+	"github.com/selvamani/stratonmesh/pkg/manifest"
 )
 
 func TestParse_ValidManifest(t *testing.T) {
@@ -76,7 +76,7 @@ func TestValidate_DuplicateServiceNames(t *testing.T) {
 	errs := manifest.Validate(stack)
 	found := false
 	for _, e := range errs {
-		if contains(e.Error(), "duplicate") || contains(e.Error(), "svc") {
+		if contains(e, "duplicate") || contains(e, "svc") {
 			found = true
 		}
 	}

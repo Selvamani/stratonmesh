@@ -2,10 +2,14 @@ package kubernetes
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os/exec"
 	"strings"
 
-	"github.com/stratonmesh/stratonmesh/pkg/manifest"
-	"github.com/stratonmesh/stratonmesh/pkg/orchestrator"
+	"github.com/selvamani/stratonmesh/pkg/manifest"
+	"github.com/selvamani/stratonmesh/pkg/orchestrator"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
@@ -116,6 +120,114 @@ func (a *Adapter) Apply(ctx context.Context, stack *manifest.Stack) error {
 	return nil
 }
 func (a *Adapter) Status(ctx context.Context, id string) (*orchestrator.AdapterStatus, error) { return &orchestrator.AdapterStatus{}, nil }
+func (a *Adapter) Stop(ctx context.Context, id string) error    { return nil }
+func (a *Adapter) Start(ctx context.Context, id string) error   { return nil }
+// Restart triggers a rolling restart of all deployments in the stack.
+func (a *Adapter) Restart(ctx context.Context, id string) error {
+	label := fmt.Sprintf("stratonmesh.io/stack=%s", id)
+	exec.CommandContext(ctx, "kubectl", "rollout", "restart", "deployment",
+		"-n", a.namespace, "-l", label).Run()
+	return nil
+}
+// Down deletes workloads and services, but preserves PersistentVolumeClaims.
+func (a *Adapter) Down(ctx context.Context, id string) error {
+	label := fmt.Sprintf("stratonmesh.io/stack=%s", id)
+	exec.CommandContext(ctx, "kubectl", "delete", "deployment,service,daemonset,statefulset",
+		"-n", a.namespace, "-l", label).Run()
+	return nil
+}
 func (a *Adapter) Destroy(ctx context.Context, id string) error { return nil }
 func (a *Adapter) Diff(ctx context.Context, d, act *manifest.Stack) (*orchestrator.DiffResult, error) { return &orchestrator.DiffResult{}, nil }
 func (a *Adapter) Rollback(ctx context.Context, id, v string) error { return nil }
+
+// Inspect returns per-pod details for a Kubernetes service.
+func (a *Adapter) Inspect(ctx context.Context, stackID, service string) (*orchestrator.ServiceDetail, error) {
+	detail := &orchestrator.ServiceDetail{Name: service}
+
+	out, err := exec.CommandContext(ctx, "kubectl", "get", "pods",
+		"-n", a.namespace,
+		"-l", fmt.Sprintf("app=%s,stratonmesh.io/stack=%s", service, stackID),
+		"-o", "json",
+	).Output()
+	if err != nil {
+		return detail, nil
+	}
+
+	var podList struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Spec struct {
+				NodeName   string `json:"nodeName"`
+				Containers []struct {
+					Image string `json:"image"`
+				} `json:"containers"`
+			} `json:"spec"`
+			Status struct {
+				Phase     string `json:"phase"`
+				StartTime string `json:"startTime"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if json.Unmarshal(out, &podList) != nil {
+		return detail, nil
+	}
+
+	for _, pod := range podList.Items {
+		if len(pod.Spec.Containers) > 0 && detail.Image == "" {
+			detail.Image = pod.Spec.Containers[0].Image
+		}
+		phase := strings.ToLower(pod.Status.Phase)
+		health := "unknown"
+		if phase == "running" {
+			health = "running"
+		} else if phase == "failed" {
+			health = "unhealthy"
+		}
+		detail.Instances = append(detail.Instances, orchestrator.InstanceInfo{
+			ID:      pod.Metadata.Name,
+			Name:    pod.Metadata.Name,
+			Status:  phase,
+			Health:  health,
+			Node:    pod.Spec.NodeName,
+			Started: pod.Status.StartTime,
+		})
+	}
+	return detail, nil
+}
+
+// Logs returns recent log lines for a Kubernetes service via kubectl logs.
+func (a *Adapter) Logs(ctx context.Context, stackID, service string, tail int) (string, error) {
+	if tail <= 0 {
+		tail = 100
+	}
+	out, _ := exec.CommandContext(ctx, "kubectl", "logs",
+		"-n", a.namespace,
+		"-l", fmt.Sprintf("app=%s", service),
+		fmt.Sprintf("--tail=%d", tail),
+		"--timestamps",
+	).Output()
+	return string(out), nil
+}
+
+// LogStream opens a live kubectl logs --follow stream for the service.
+func (a *Adapter) LogStream(ctx context.Context, stackID, service string) (io.ReadCloser, error) {
+	cmd := exec.CommandContext(ctx, "kubectl", "logs",
+		"-n", a.namespace,
+		"-l", fmt.Sprintf("app=%s", service),
+		"--follow", "--tail=50", "--timestamps",
+	)
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		return nil, fmt.Errorf("kubectl logs: %w", err)
+	}
+	go func() {
+		cmd.Wait() //nolint:errcheck
+		pw.Close()
+	}()
+	return pr, nil
+}

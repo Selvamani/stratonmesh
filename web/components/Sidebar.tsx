@@ -8,6 +8,7 @@ const NAV = [
   { href: '/stacks',   label: 'Stacks',    icon: LayersIcon },
   { href: '/nodes',    label: 'Nodes',     icon: ServerIcon },
   { href: '/catalog',  label: 'Catalog',   icon: BookIcon },
+  { href: '/reports',  label: 'Reports',   icon: ReportIcon },
 ];
 
 export function Sidebar() {
@@ -99,6 +100,15 @@ function BookIcon({ className }: { className?: string }) {
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
       <path strokeLinecap="round" strokeLinejoin="round"
         d="M4 19.5A2.5 2.5 0 016.5 17H20M4 19.5A2.5 2.5 0 004 17V4.5A2.5 2.5 0 016.5 2H20v17H6.5" />
+    </svg>
+  );
+}
+
+function ReportIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path strokeLinecap="round" d="M7 8h10M7 12h10M7 16h6" />
     </svg>
   );
 }

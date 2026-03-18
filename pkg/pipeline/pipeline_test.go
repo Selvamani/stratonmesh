@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/stratonmesh/stratonmesh/pkg/manifest"
-	"github.com/stratonmesh/stratonmesh/pkg/pipeline"
+	"github.com/selvamani/stratonmesh/pkg/manifest"
+	"github.com/selvamani/stratonmesh/pkg/pipeline"
 )
 
 // newTestPipeline creates a Pipeline without a real store or bus (nil-safe for unit tests).

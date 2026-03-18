@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stratonmesh/stratonmesh/pkg/autoscaler"
-	"github.com/stratonmesh/stratonmesh/pkg/manifest"
+	"github.com/selvamani/stratonmesh/pkg/autoscaler"
+	"github.com/selvamani/stratonmesh/pkg/manifest"
 )
 
 // mockOrch satisfies autoscaler.Orchestrator for testing.

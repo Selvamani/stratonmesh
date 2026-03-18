@@ -21,7 +21,7 @@ export function TopBar() {
       <div className="flex items-center gap-3">
         <PollIndicator />
         <a
-          href="https://github.com/stratonmesh/stratonmesh"
+          href="https://github.com/selvamani/stratonmesh"
           target="_blank"
           rel="noreferrer"
           className="text-sm-muted hover:text-sm-text transition-colors"

@@ -3,7 +3,7 @@ package catalog_test
 import (
 	"testing"
 
-	"github.com/stratonmesh/stratonmesh/pkg/catalog"
+	"github.com/selvamani/stratonmesh/pkg/catalog"
 )
 
 func TestDefaultProfiles_Present(t *testing.T) {

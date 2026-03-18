@@ -14,7 +14,7 @@ The system manages the full lifecycle: onboarding (Git import → blueprint cata
 2. **Catalog Onboarding Layer** — Git importer, format parsers (Compose, Helm, K8s, Dockerfile), blueprint catalog in etcd, instantiation engine with size profiles
 3. **IaC pipeline + GitOps** — 7 stages: parse → resolve env → interpolate vars → diff → policy gate → apply to intent store → reconcile
 4. **Control plane** — Stack orchestrator (state machine), scheduler (placement engine), config manager (Vault + etcd), version ledger (rollback)
-5. **Platform adapter layer** — Docker, Compose, Kubernetes, Terraform, Pulumi, Process/systemd — all implement the `PlatformAdapter` interface
+5. **Platform adapter layer** — Docker, Compose, Docker Swarm, Kubernetes, Terraform, Pulumi, Process/systemd — all implement the `PlatformAdapter` interface
 6. **Hybrid service mesh** — CoreDNS (Layer 1), service registry in etcd (Layer 2), smart proxy (Layer 3), optional sidecar with mTLS (Layer 4). NATS is async messaging only, NOT service discovery.
 7. **Observability** — NATS JetStream (telemetry bus), VictoriaMetrics (metrics), Loki (logs), Tempo (traces), Grafana (dashboards), auto-scaler (feedback loop)
 
@@ -84,8 +84,10 @@ type PlatformAdapter interface {
     Name() string
     Generate(ctx context.Context, stack *manifest.Stack) ([]byte, error)
     Apply(ctx context.Context, stack *manifest.Stack) error
+    Stop(ctx context.Context, stackID string) error      // pause — containers stopped, volumes intact
+    Start(ctx context.Context, stackID string) error     // resume stopped stack
     Status(ctx context.Context, stackID string) (*AdapterStatus, error)
-    Destroy(ctx context.Context, stackID string) error
+    Destroy(ctx context.Context, stackID string) error   // tear down + delete volumes
     Diff(ctx context.Context, desired, actual *manifest.Stack) (*DiffResult, error)
     Rollback(ctx context.Context, stackID string, version string) error
 }
@@ -131,6 +133,14 @@ The store uses etcd watches for real-time notifications and compare-and-swap for
 ### Orchestrator State Machine (pkg/orchestrator/orchestrator.go)
 
 States: `pending → scheduling → provisioning → deploying → verifying → running → draining → stopped`
+
+Additional states: `stopping` (Stop in progress), `starting` (Start in progress), `rolling_back`.
+
+Stop/Start lifecycle: `running → stopping → stopped → starting → running`. Containers are paused (not removed) and volumes are preserved. Stop/Start state is persisted in etcd so it survives controller restarts.
+
+Destroy always removes containers **and volumes** (`down -v`).
+
+Scale: `Scale()` immediately calls `adapter.Apply()` in a background goroutine — doesn't wait for the 30-second reconcile tick. Compose adapter passes `--scale svc=N` flags.
 
 Failure handling: `deploying` or `verifying` can transition to `failed`. From `failed`, three paths: retry (up to 3x), automatic rollback (if `rollbackOnFailure: true`), or park for operator intervention.
 
@@ -220,6 +230,22 @@ make build
 - [x] Error types, structured logging, version injection
 - [x] Example manifests (Mailu, Nextcloud)
 - [x] Makefile, Dockerfile, dev compose stack
+
+### Implemented (Phase 5 — lifecycle + ports + UX)
+- [x] Docker Swarm adapter (`pkg/adapters/swarm/adapter.go`) — `docker stack deploy`, `docker service scale` for stop/start, `docker service ls` for status, overlay network + deploy sections in generated compose, registered as platform `"swarm"`
+- [x] Stack Stop/Start — `orchestrator.Stop/Start()`, `POST /v1/stacks/{id}/stop|start`, persisted in etcd; compose/docker/k8s adapters all implement the interface
+- [x] Destroy with volumes — `docker compose down -v --remove-orphans`; Docker adapter removes named volumes prefixed with stack name
+- [x] Port allocator (`pkg/portalloc/portalloc.go`) — `FindAvailable(preferred)` and `FindInRange(start,end)` for dynamic host port assignment
+- [x] `PortSpec.HostRange` — `hostRange: "8080-8090"` in manifest; `ResolveHostPort()` method on `PortSpec` for adapters to use
+- [x] External network auto-creation — compose adapter detects `external: true` networks and runs `docker network create` before `compose up`
+- [x] Scale fix — orchestrator `Scale()` immediately calls `adapter.Apply()` instead of waiting for reconcile loop
+- [x] Compose scale — `--scale svc=N` flags passed to `docker compose up`; `--no-build --no-recreate` when project already running
+- [x] Blueprint manifest deserialisation — `blueprintToStack()` now tries JSON then falls back to YAML; handles all storage formats (JSON string, JSON object, YAML text)
+- [x] Web UI stop/start/destroy buttons — stacks list shows contextual Stop/Start/Destroy per stack status
+- [x] Deploy modal edit/preview tabs — manifest textarea with Edit + Preview tabs; platform injected into preview
+- [x] `SM_REPOS_DIR` env var — custom repo clone directory; three-tier fallback: per-request > env var > hardcoded default
+- [x] Deep repo scanning — `detectFormatsDeep()` recursive scan up to depth 3 for repos with non-root compose files (e.g. jitsi-meet)
+- [x] Manifest preview + regeneration API — `GET/POST /v1/catalog/{name}/manifest`, `PUT` to save user-edited YAML
 
 ### Implemented (Phase 3-4)
 - [x] gRPC API proto definitions (`api/proto/stratonmesh.proto`) — StackService, CatalogService, NodeService with REST gateway annotations

@@ -21,28 +21,30 @@ func LoadFile(path string) (*Stack, error) {
 }
 
 // Parse decodes YAML bytes into a Stack.
+// After unmarshalling, portVar references in PortSpec fields are resolved from
+// the stack's portVars map so that HostRange / Host are ready for allocation.
 func Parse(data []byte) (*Stack, error) {
 	// The YAML may have a top-level "stack:" key or be flat
 	var wrapper struct {
 		Stack Stack `yaml:"stack"`
 	}
-	if err := yaml.Unmarshal(data, &wrapper); err != nil {
-		// Try flat format (no wrapper key)
+	var stack *Stack
+	if err := yaml.Unmarshal(data, &wrapper); err != nil || wrapper.Stack.Name == "" {
 		var flat Stack
 		if err2 := yaml.Unmarshal(data, &flat); err2 != nil {
-			return nil, fmt.Errorf("parse manifest: %w", err)
+			if err != nil {
+				return nil, fmt.Errorf("parse manifest: %w", err)
+			}
+			return nil, fmt.Errorf("parse manifest: %w", err2)
 		}
-		return &flat, nil
+		stack = &flat
+	} else {
+		stack = &wrapper.Stack
 	}
-	if wrapper.Stack.Name == "" {
-		// Was flat after all
-		var flat Stack
-		if err := yaml.Unmarshal(data, &flat); err != nil {
-			return nil, fmt.Errorf("parse manifest: %w", err)
-		}
-		return &flat, nil
+	if err := ResolvePortVarRefs(stack); err != nil {
+		return nil, fmt.Errorf("resolve portVars: %w", err)
 	}
-	return &wrapper.Stack, nil
+	return stack, nil
 }
 
 // Validate checks a manifest for structural correctness.

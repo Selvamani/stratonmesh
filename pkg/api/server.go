@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,12 +14,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/stratonmesh/stratonmesh/pkg/catalog"
-	"github.com/stratonmesh/stratonmesh/pkg/importer"
-	"github.com/stratonmesh/stratonmesh/pkg/manifest"
-	"github.com/stratonmesh/stratonmesh/pkg/orchestrator"
-	"github.com/stratonmesh/stratonmesh/pkg/pipeline"
-	"github.com/stratonmesh/stratonmesh/pkg/store"
+	"github.com/selvamani/stratonmesh/pkg/catalog"
+	"github.com/selvamani/stratonmesh/pkg/importer"
+	"github.com/selvamani/stratonmesh/pkg/manifest"
+	"github.com/selvamani/stratonmesh/pkg/orchestrator"
+	"github.com/selvamani/stratonmesh/pkg/pipeline"
+	"github.com/selvamani/stratonmesh/pkg/snapshot"
+	"github.com/selvamani/stratonmesh/pkg/store"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
@@ -26,12 +28,39 @@ import (
 // Orchestrator is the minimal interface the API server uses.
 type Orchestrator interface {
 	Scale(ctx context.Context, stackID, service string, replicas int) error
+	Stop(ctx context.Context, stackID string) error
+	Start(ctx context.Context, stackID string) error
+	Restart(ctx context.Context, stackID string) error
+	Down(ctx context.Context, stackID string) error
 	Destroy(ctx context.Context, stackID string) error
 	Rollback(ctx context.Context, stackID string) error
+	Redeploy(ctx context.Context, stackID string) error
 	Status(ctx context.Context, stackID string) (*orchestrator.StackContext, error)
+	ServiceInspect(ctx context.Context, stackID, service string) (*orchestrator.ServiceDetail, error)
+	ServiceLogs(ctx context.Context, stackID, service string, tail int) (string, error)
+	ServiceLogStream(ctx context.Context, stackID, service string) (io.ReadCloser, error)
+}
+
+// SnapshotEngine is the minimal snapshot interface the API server uses.
+type SnapshotEngine interface {
+	Create(ctx context.Context, stackID, label string, tags map[string]string) (*snapshot.Snapshot, error)
+	List(ctx context.Context, stackID string) ([]snapshot.Snapshot, error)
+	Get(ctx context.Context, stackID, snapshotID string) (*snapshot.Snapshot, error)
+	Restore(ctx context.Context, stackID, snapshotID string) error
+	Clone(ctx context.Context, sourceStackID, snapshotID, newStackID string) (*snapshot.Snapshot, error)
+	Delete(ctx context.Context, stackID, snapshotID string) error
 }
 
 // Server exposes the StratonMesh control plane over a REST/JSON HTTP API.
+//
+// Snapshot routes:
+//
+//	POST   /v1/stacks/{id}/snapshots              create snapshot
+//	GET    /v1/stacks/{id}/snapshots              list snapshots
+//	GET    /v1/stacks/{id}/snapshots/{sid}        get snapshot
+//	POST   /v1/stacks/{id}/snapshots/{sid}/restore restore snapshot
+//	POST   /v1/stacks/{id}/snapshots/{sid}/clone  clone to new stack
+//	DELETE /v1/stacks/{id}/snapshots/{sid}        delete snapshot
 //
 // Routes:
 //
@@ -59,19 +88,21 @@ type Server struct {
 	orch     Orchestrator
 	imp      *importer.Importer
 	cat      *catalog.Engine
+	snaps    SnapshotEngine // nil if MinIO not configured
 	logger   *zap.SugaredLogger
 	version  string
 	mux      *http.ServeMux
 }
 
 // New creates a REST API Server.
-func New(st *store.Store, pl *pipeline.Pipeline, orch Orchestrator, imp *importer.Importer, cat *catalog.Engine, version string, logger *zap.SugaredLogger) *Server {
+func New(st *store.Store, pl *pipeline.Pipeline, orch Orchestrator, imp *importer.Importer, cat *catalog.Engine, snaps SnapshotEngine, version string, logger *zap.SugaredLogger) *Server {
 	s := &Server{
 		store:    st,
 		pipeline: pl,
 		orch:     orch,
 		imp:      imp,
 		cat:      cat,
+		snaps:    snaps,
 		version:  version,
 		logger:   logger,
 		mux:      http.NewServeMux(),
@@ -93,6 +124,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/stacks", s.handleStacks)
 	s.mux.HandleFunc("/v1/stacks/", s.handleStackPath)
 	s.mux.HandleFunc("/v1/nodes", s.handleNodes)
+	s.mux.HandleFunc("/v1/events", s.handleEvents)
 	s.mux.HandleFunc("/v1/catalog", s.handleCatalog)
 	s.mux.HandleFunc("/v1/catalog/import", s.handleCatalogImport)
 	s.mux.HandleFunc("/v1/catalog/instantiate", s.handleCatalogInstantiateByBody)
@@ -148,11 +180,29 @@ func (s *Server) handleStacks(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]interface{}{"stacks": stacks, "count": len(stacks)})
 
 	case http.MethodPost:
-		// Deploy from JSON manifest body
-		var stack manifest.Stack
-		if err := json.NewDecoder(r.Body).Decode(&stack); err != nil {
-			jsonErr(w, http.StatusBadRequest, fmt.Errorf("invalid manifest JSON: %w", err))
+		// Deploy from manifest body — accepts JSON or YAML.
+		// Detect by Content-Type header; default to YAML when ambiguous.
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			jsonErr(w, http.StatusBadRequest, fmt.Errorf("read body: %w", err))
 			return
+		}
+		var stack manifest.Stack
+		ct := r.Header.Get("Content-Type")
+		if ct == "application/json" {
+			if err := json.Unmarshal(body, &stack); err != nil {
+				jsonErr(w, http.StatusBadRequest, fmt.Errorf("invalid manifest JSON: %w", err))
+				return
+			}
+		} else {
+			// YAML (or unknown content-type — try YAML first, fall back to JSON)
+			if err := yaml.Unmarshal(body, &stack); err != nil {
+				// Try JSON as fallback
+				if err2 := json.Unmarshal(body, &stack); err2 != nil {
+					jsonErr(w, http.StatusBadRequest, fmt.Errorf("invalid manifest (expected YAML or JSON): %w", err))
+					return
+				}
+			}
 		}
 		if errs := manifest.Validate(&stack); len(errs) > 0 {
 			jsonErr(w, http.StatusBadRequest, fmt.Errorf("validation: %v", errs))
@@ -162,9 +212,12 @@ func (s *Server) handleStacks(w http.ResponseWriter, r *http.Request) {
 			jsonErr(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.store.SetStatus(ctx, stack.Name, "pending")
 		s.logger.Infow("stack deploy requested via API", "stack", stack.Name)
-		jsonOK(w, map[string]interface{}{"id": stack.Name, "status": "pending"})
+		if err := s.orch.Redeploy(ctx, stack.Name); err != nil {
+			jsonErr(w, http.StatusInternalServerError, fmt.Errorf("deploy: %w", err))
+			return
+		}
+		jsonOK(w, map[string]interface{}{"id": stack.Name, "status": "deploying"})
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -186,15 +239,37 @@ func (s *Server) handleStackPath(w http.ResponseWriter, r *http.Request) {
 
 	// Sub-resource?
 	if len(parts) == 2 {
-		switch parts[1] {
+		sub := parts[1]
+		// Handle deeper paths: services/{svc}/inspect and services/{svc}/logs
+		if strings.HasPrefix(sub, "services/") {
+			s.handleServiceSub(w, r, ctx, stackID, strings.TrimPrefix(sub, "services/"))
+			return
+		}
+		if strings.HasPrefix(sub, "snapshots") {
+			s.handleSnapshotPath(w, r, ctx, stackID, strings.TrimPrefix(sub, "snapshots"))
+			return
+		}
+		switch sub {
 		case "scale":
 			s.handleScale(w, r, ctx, stackID)
+		case "redeploy":
+			s.handleRedeploy(w, r, ctx, stackID)
+		case "stop":
+			s.handleStop(w, r, ctx, stackID)
+		case "start":
+			s.handleStart(w, r, ctx, stackID)
+		case "down":
+			s.handleDown(w, r, ctx, stackID)
+		case "restart":
+			s.handleRestart(w, r, ctx, stackID)
 		case "rollback":
 			s.handleRollback(w, r, ctx, stackID)
 		case "ledger":
 			s.handleLedger(w, r, ctx, stackID)
 		case "manifest":
 			s.handleManifest(w, r, ctx, stackID)
+		case "events":
+			s.handleStackEvents(w, r, ctx, stackID)
 		default:
 			http.NotFound(w, r)
 		}
@@ -283,6 +358,66 @@ func (s *Server) handleScale(w http.ResponseWriter, r *http.Request, ctx context
 	jsonOK(w, map[string]interface{}{"stack": stackID, "service": req.Service, "replicas": req.Replicas})
 }
 
+func (s *Server) handleRedeploy(w http.ResponseWriter, r *http.Request, ctx context.Context, stackID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.orch.Redeploy(ctx, stackID); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	jsonOK(w, map[string]string{"stack": stackID, "status": "deploying"})
+}
+
+func (s *Server) handleStop(w http.ResponseWriter, r *http.Request, ctx context.Context, stackID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.orch.Stop(ctx, stackID); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	jsonOK(w, map[string]string{"stack": stackID, "status": "stopped"})
+}
+
+func (s *Server) handleDown(w http.ResponseWriter, r *http.Request, ctx context.Context, stackID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.orch.Down(ctx, stackID); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	jsonOK(w, map[string]string{"stack": stackID, "status": "down"})
+}
+
+func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request, ctx context.Context, stackID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.orch.Restart(ctx, stackID); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	jsonOK(w, map[string]string{"stack": stackID, "status": "running"})
+}
+
+func (s *Server) handleStart(w http.ResponseWriter, r *http.Request, ctx context.Context, stackID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.orch.Start(ctx, stackID); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	jsonOK(w, map[string]string{"stack": stackID, "status": "running"})
+}
+
 func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request, ctx context.Context, stackID string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -306,6 +441,234 @@ func (s *Server) handleLedger(w http.ResponseWriter, r *http.Request, ctx contex
 		return
 	}
 	jsonOK(w, map[string]interface{}{"stack": stackID, "entries": entries})
+}
+
+// handleServiceSub routes GET /v1/stacks/{id}/services/{svc}/inspect and /logs.
+func (s *Server) handleServiceSub(w http.ResponseWriter, r *http.Request, ctx context.Context, stackID, sub string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// sub is like "web/inspect" or "web/logs"
+	parts := strings.SplitN(sub, "/", 2)
+	if len(parts) != 2 {
+		http.NotFound(w, r)
+		return
+	}
+	service, action := parts[0], parts[1]
+	switch action {
+	case "inspect":
+		detail, err := s.orch.ServiceInspect(ctx, stackID, service)
+		if err != nil {
+			jsonErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		jsonOK(w, detail)
+	case "logs":
+		tail := 100
+		if t := r.URL.Query().Get("tail"); t != "" {
+			fmt.Sscanf(t, "%d", &tail)
+		}
+		logs, err := s.orch.ServiceLogs(ctx, stackID, service, tail)
+		if err != nil {
+			jsonErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte(logs))
+	case "logs/stream":
+		s.handleServiceLogStream(w, r, ctx, stackID, service)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// handleServiceLogStream serves GET /v1/stacks/{id}/services/{svc}/logs/stream as SSE.
+// Each log line is emitted as a Server-Sent Event: "data: <line>\n\n".
+// The connection stays open until the client disconnects or the container exits.
+func (s *Server) handleServiceLogStream(w http.ResponseWriter, r *http.Request, ctx context.Context, stackID, service string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported by this server", http.StatusInternalServerError)
+		return
+	}
+	rc, err := s.orch.ServiceLogStream(ctx, stackID, service)
+	if err != nil {
+		jsonErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer rc.Close()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // disable nginx/proxy buffering
+
+	scanner := bufio.NewScanner(rc)
+	scanner.Buffer(make([]byte, 64*1024), 64*1024) // handle long lines
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		line := scanner.Text()
+		// Escape newlines within a line so SSE framing is not broken.
+		line = strings.ReplaceAll(line, "\n", "↵")
+		fmt.Fprintf(w, "data: %s\n\n", line)
+		flusher.Flush()
+	}
+	// Signal stream end to the client.
+	fmt.Fprintf(w, "event: end\ndata: stream closed\n\n")
+	flusher.Flush()
+}
+
+// handleStackEvents serves GET /v1/stacks/{id}/events.
+func (s *Server) handleStackEvents(w http.ResponseWriter, r *http.Request, ctx context.Context, stackID string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		fmt.Sscanf(l, "%d", &limit)
+	}
+	events, err := s.store.ListEvents(ctx, stackID, limit)
+	if err != nil {
+		jsonErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if events == nil {
+		events = []store.OperationEvent{}
+	}
+	jsonOK(w, map[string]interface{}{"stack": stackID, "events": events})
+}
+
+// handleSnapshotPath routes /v1/stacks/{id}/snapshots[/{sid}[/{action}]].
+// sub is everything after "snapshots" (may be "", "/{sid}", "/{sid}/restore", etc.)
+func (s *Server) handleSnapshotPath(w http.ResponseWriter, r *http.Request, ctx context.Context, stackID, sub string) {
+	if s.snaps == nil {
+		jsonErr(w, http.StatusServiceUnavailable, fmt.Errorf("snapshot engine not configured (set SM_MINIO_ENDPOINT)"))
+		return
+	}
+	// Trim leading slash.
+	sub = strings.TrimPrefix(sub, "/")
+
+	// No snapshot ID — list or create.
+	if sub == "" {
+		switch r.Method {
+		case http.MethodGet:
+			snaps, err := s.snaps.List(ctx, stackID)
+			if err != nil {
+				jsonErr(w, http.StatusInternalServerError, err)
+				return
+			}
+			if snaps == nil {
+				snaps = []snapshot.Snapshot{}
+			}
+			jsonOK(w, map[string]interface{}{"stack": stackID, "snapshots": snaps})
+		case http.MethodPost:
+			var req struct {
+				Label string            `json:"label"`
+				Tags  map[string]string `json:"tags"`
+			}
+			json.NewDecoder(r.Body).Decode(&req) //nolint:errcheck
+			snap, err := s.snaps.Create(ctx, stackID, req.Label, req.Tags)
+			if err != nil {
+				jsonErr(w, http.StatusInternalServerError, err)
+				return
+			}
+			jsonOK(w, snap)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	// Have a snapshot ID — maybe also an action.
+	parts := strings.SplitN(sub, "/", 2)
+	snapshotID := parts[0]
+	action := ""
+	if len(parts) == 2 {
+		action = parts[1]
+	}
+
+	switch action {
+	case "":
+		switch r.Method {
+		case http.MethodGet:
+			snap, err := s.snaps.Get(ctx, stackID, snapshotID)
+			if err != nil {
+				jsonErr(w, http.StatusNotFound, err)
+				return
+			}
+			jsonOK(w, snap)
+		case http.MethodDelete:
+			if err := s.snaps.Delete(ctx, stackID, snapshotID); err != nil {
+				jsonErr(w, http.StatusInternalServerError, err)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	case "restore":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := s.snaps.Restore(ctx, stackID, snapshotID); err != nil {
+			jsonErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		jsonOK(w, map[string]string{"stack": stackID, "snapshot": snapshotID, "status": "restored"})
+	case "clone":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			NewStackID string `json:"newStackId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.NewStackID == "" {
+			jsonErr(w, http.StatusBadRequest, fmt.Errorf("newStackId is required"))
+			return
+		}
+		cloned, err := s.snaps.Clone(ctx, stackID, snapshotID, req.NewStackID)
+		if err != nil {
+			jsonErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		jsonOK(w, cloned)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// handleEvents serves GET /v1/events (all stacks).
+func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ctx := r.Context()
+	limit := 100
+	if l := r.URL.Query().Get("limit"); l != "" {
+		fmt.Sscanf(l, "%d", &limit)
+	}
+	events, err := s.store.ListAllEvents(ctx, limit)
+	if err != nil {
+		jsonErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if events == nil {
+		events = []store.OperationEvent{}
+	}
+	jsonOK(w, map[string]interface{}{"events": events, "count": len(events)})
 }
 
 // --- Nodes ---
@@ -360,9 +723,12 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request, ctx cont
 			jsonErr(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.store.SetStatus(ctx, stackID, "pending")
-		s.logger.Infow("manifest updated via API", "stack", stackID)
-		jsonOK(w, map[string]string{"status": "pending"})
+		s.logger.Infow("manifest updated via API, triggering redeploy", "stack", stackID)
+		if err := s.orch.Redeploy(ctx, stackID); err != nil {
+			jsonErr(w, http.StatusInternalServerError, fmt.Errorf("redeploy: %w", err))
+			return
+		}
+		jsonOK(w, map[string]string{"status": "deploying"})
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -409,6 +775,8 @@ func (s *Server) handleCatalogItem(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.handleCatalogFiles(w, r, name)
+		case "manifest":
+			s.handleCatalogManifest(w, r, name)
 		default:
 			http.NotFound(w, r)
 		}
@@ -531,6 +899,113 @@ func (s *Server) handleCatalogFiles(w http.ResponseWriter, r *http.Request, name
 	})
 	sort.Strings(files)
 	jsonOK(w, map[string]interface{}{"files": files, "repoPath": bp.LocalPath})
+}
+
+// handleCatalogManifest handles GET and POST /v1/catalog/{name}/manifest.
+//
+//	GET  ?file=<relative-path>  — parse the file and return the manifest preview (JSON + YAML).
+//	POST {"file":"<path>"}       — re-generate the blueprint's stored manifest from the file and
+//	                              save it back to etcd so future instantiations use the new manifest.
+func (s *Server) handleCatalogManifest(w http.ResponseWriter, r *http.Request, name string) {
+	bp, err := s.store.GetBlueprint(r.Context(), name)
+	if err != nil {
+		jsonErr(w, http.StatusNotFound, err)
+		return
+	}
+	if bp.LocalPath == "" {
+		jsonErr(w, http.StatusBadRequest, fmt.Errorf("blueprint %q has no local repo clone; re-import with mode=repo", name))
+		return
+	}
+
+	var filePath string
+	switch r.Method {
+	case http.MethodGet:
+		filePath = r.URL.Query().Get("file")
+		if filePath == "" {
+			jsonErr(w, http.StatusBadRequest, fmt.Errorf("file query parameter is required"))
+			return
+		}
+	case http.MethodPost:
+		var body struct {
+			File string `json:"file"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.File == "" {
+			jsonErr(w, http.StatusBadRequest, fmt.Errorf("body must be {\"file\":\"<relative-path>\"}"))
+			return
+		}
+		filePath = body.File
+	case http.MethodPut:
+		// Save user-edited YAML directly (no re-parse from disk).
+		rawYAML, err := io.ReadAll(r.Body)
+		if err != nil || len(rawYAML) == 0 {
+			jsonErr(w, http.StatusBadRequest, fmt.Errorf("request body must be non-empty YAML"))
+			return
+		}
+		var stack manifest.Stack
+		if err := yaml.Unmarshal(rawYAML, &stack); err != nil {
+			jsonErr(w, http.StatusUnprocessableEntity, fmt.Errorf("invalid YAML: %w", err))
+			return
+		}
+		if stack.Name == "" {
+			stack.Name = bp.Name
+		}
+		manifestJSON, err := json.Marshal(stack)
+		if err != nil {
+			jsonErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		bp.Manifest = string(manifestJSON)
+		if err := s.store.SaveBlueprint(r.Context(), *bp); err != nil {
+			jsonErr(w, http.StatusInternalServerError, fmt.Errorf("save blueprint: %w", err))
+			return
+		}
+		s.logger.Infow("blueprint manifest saved from user edit", "blueprint", name)
+		jsonOK(w, map[string]interface{}{
+			"blueprint": name,
+			"manifest":  stack,
+			"yaml":      string(rawYAML),
+		})
+		return
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	stack, err := s.imp.ParseRepoFile(bp.Name, bp.LocalPath, filePath)
+	if err != nil {
+		jsonErr(w, http.StatusUnprocessableEntity, fmt.Errorf("parse %s: %w", filePath, err))
+		return
+	}
+	stack.Name = bp.Name
+
+	yamlBytes, err := yaml.Marshal(stack)
+	if err != nil {
+		jsonErr(w, http.StatusInternalServerError, fmt.Errorf("marshal manifest: %w", err))
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		// Re-encode the new stack into the blueprint and persist to etcd.
+		manifestJSON, err := json.Marshal(stack)
+		if err != nil {
+			jsonErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		bp.Manifest = string(manifestJSON)
+		bp.GitPath = filePath
+		if err := s.store.SaveBlueprint(r.Context(), *bp); err != nil {
+			jsonErr(w, http.StatusInternalServerError, fmt.Errorf("save blueprint: %w", err))
+			return
+		}
+		s.logger.Infow("blueprint manifest regenerated", "blueprint", name, "file", filePath)
+	}
+
+	jsonOK(w, map[string]interface{}{
+		"blueprint": name,
+		"file":      filePath,
+		"manifest":  stack,
+		"yaml":      string(yamlBytes),
+	})
 }
 
 // handleCatalogInstantiateByBody handles POST /v1/catalog/instantiate with name in the JSON body.

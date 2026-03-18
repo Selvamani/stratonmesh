@@ -3,13 +3,17 @@ package compose
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
-	"github.com/stratonmesh/stratonmesh/pkg/manifest"
-	"github.com/stratonmesh/stratonmesh/pkg/orchestrator"
+	"github.com/selvamani/stratonmesh/pkg/manifest"
+	"github.com/selvamani/stratonmesh/pkg/orchestrator"
+	"github.com/selvamani/stratonmesh/pkg/portalloc"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
@@ -55,7 +59,13 @@ func (a *Adapter) Generate(ctx context.Context, stack *manifest.Stack) ([]byte, 
 			cs["deploy"] = map[string]interface{}{"replicas": svc.DefaultReplicas()}
 		}
 		var ports []string
-		for _, p := range svc.Ports { ports = append(ports, fmt.Sprintf("%d", p.Expose)) }
+		for _, p := range svc.Ports {
+			if p.Host > 0 {
+				ports = append(ports, fmt.Sprintf("%d:%d", p.Host, p.Expose))
+			} else {
+				ports = append(ports, fmt.Sprintf("%d", p.Expose))
+			}
+		}
 		if len(ports) > 0 { cs["ports"] = ports }
 		var volMounts []string
 		for _, v := range svc.Volumes {
@@ -79,6 +89,23 @@ func (a *Adapter) Generate(ctx context.Context, stack *manifest.Stack) ([]byte, 
 }
 
 func (a *Adapter) Apply(ctx context.Context, stack *manifest.Stack) error {
+	// Allocate dynamic ports declared via portVars, then inject the concrete
+	// port numbers into any service env vars that reference $varname.
+	if len(stack.PortVars) > 0 {
+		resolved, err := manifest.AllocatePorts(stack, func(start, end int) (int, error) {
+			if end > start {
+				return portalloc.FindInRange(start, end)
+			}
+			return portalloc.FindAvailable(start)
+		})
+		if err != nil {
+			return fmt.Errorf("allocate ports: %w", err)
+		}
+		manifest.InjectResolvedPorts(stack, resolved)
+		if len(resolved) > 0 {
+			a.logger.Infow("port vars resolved", "stack", stack.Name, "ports", resolved)
+		}
+	}
 	if stack.Metadata.RepoPath != "" {
 		return a.applyFromRepo(ctx, stack)
 	}
@@ -93,7 +120,9 @@ func (a *Adapter) Apply(ctx context.Context, stack *manifest.Stack) error {
 }
 
 // applyFromRepo builds images from local source then starts the stack.
-// Uses `docker compose up --build -d` so compose handles build+start atomically.
+// On the first deploy it runs `docker compose up --build -d`.
+// On subsequent calls (e.g. scale), it uses `--no-build --no-recreate` so existing
+// containers are not restarted; only new replicas are added.
 func (a *Adapter) applyFromRepo(ctx context.Context, stack *manifest.Stack) error {
 	var composePath string
 	if stack.Metadata.DeployFile != "" {
@@ -108,19 +137,100 @@ func (a *Adapter) applyFromRepo(ctx context.Context, stack *manifest.Stack) erro
 	stackDir := filepath.Join(a.workDir, stack.Name)
 	os.MkdirAll(stackDir, 0755)
 	os.WriteFile(filepath.Join(stackDir, "repo-path"), []byte(stack.Metadata.RepoPath), 0644)
+	os.WriteFile(filepath.Join(stackDir, "compose-path"), []byte(composePath), 0644)
 
-	a.logger.Infow("deploying from source repo", "stack", stack.Name, "compose", composePath)
+	// Ensure any external networks declared in the compose file exist.
+	if err := a.ensureExternalNetworks(ctx, composePath); err != nil {
+		a.logger.Warnw("could not pre-create external networks", "error", err)
+	}
+
+	// Detect whether the project already has running containers to decide
+	// whether to build images (first deploy) or just reconcile replicas (scale).
+	alreadyRunning := a.projectRunning(ctx, stack.Name)
+
+	args := []string{"compose", "-f", composePath, "-p", stack.Name, "up", "-d"}
+	if alreadyRunning {
+		// Avoid rebuilding or restarting healthy containers; just add/remove replicas.
+		args = append(args, "--no-build", "--no-recreate")
+	} else {
+		args = append(args, "--build")
+	}
+
+	// Pass explicit --scale overrides for every service that has Replicas set.
+	for _, svc := range stack.Services {
+		if svc.Replicas > 0 {
+			args = append(args, "--scale", fmt.Sprintf("%s=%d", svc.Name, svc.Replicas))
+		}
+	}
+
+	a.logger.Infow("deploying from source repo",
+		"stack", stack.Name,
+		"compose", composePath,
+		"already_running", alreadyRunning,
+	)
 
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, "docker", "compose",
-		"-f", composePath,
-		"-p", stack.Name,
-		"up", "--build", "-d",
-	)
+	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = &teeWriter{w1: os.Stderr, w2: &stderr}
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("docker compose up --build: %w\n%s", err, stderr.String())
+		return fmt.Errorf("docker compose up: %w\n%s", err, stderr.String())
+	}
+	return nil
+}
+
+// projectRunning returns true if the compose project already has at least one running container.
+func (a *Adapter) projectRunning(ctx context.Context, projectName string) bool {
+	out, err := exec.CommandContext(ctx, "docker", "compose", "-p", projectName, "ps", "-q", "--status", "running").Output()
+	return err == nil && len(bytes.TrimSpace(out)) > 0
+}
+
+// ensureExternalNetworks reads a compose file, finds networks marked external: true,
+// and creates them in Docker if they don't already exist.
+func (a *Adapter) ensureExternalNetworks(ctx context.Context, composePath string) error {
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		return err
+	}
+	var cf struct {
+		Networks map[string]struct {
+			External interface{} `yaml:"external"` // bool or {name: ...}
+			Name     string      `yaml:"name"`
+		} `yaml:"networks"`
+	}
+	if err := yaml.Unmarshal(data, &cf); err != nil {
+		return err
+	}
+	for netKey, netCfg := range cf.Networks {
+		isExternal := false
+		switch v := netCfg.External.(type) {
+		case bool:
+			isExternal = v
+		case map[string]interface{}:
+			isExternal = true // old-style: external: {name: foo}
+		case map[interface{}]interface{}:
+			isExternal = true
+		}
+		if !isExternal {
+			continue
+		}
+		// Resolve the actual network name (may differ from the key via `name:` field).
+		networkName := netKey
+		if netCfg.Name != "" {
+			networkName = netCfg.Name
+		}
+		// docker network create is idempotent with --driver bridge; ignore "already exists".
+		out, err := exec.CommandContext(ctx, "docker", "network", "create", "--driver", "bridge", networkName).CombinedOutput()
+		if err != nil {
+			msg := strings.ToLower(string(out))
+			if strings.Contains(msg, "already exists") || strings.Contains(msg, "network with name") {
+				a.logger.Debugw("external network already exists", "network", networkName)
+				continue
+			}
+			a.logger.Warnw("failed to create external network", "network", networkName, "error", string(out))
+		} else {
+			a.logger.Infow("created external network", "network", networkName)
+		}
 	}
 	return nil
 }
@@ -136,30 +246,408 @@ func (t *teeWriter) Write(p []byte) (int, error) {
 }
 
 func (a *Adapter) findComposeFile(repoPath string) string {
-	for _, name := range []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"} {
+	names := []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
+	// Check root first.
+	for _, name := range names {
 		if _, err := os.Stat(filepath.Join(repoPath, name)); err == nil {
 			return filepath.Join(repoPath, name)
 		}
 	}
-	return ""
+	// Fall back: walk subdirectories up to depth 3.
+	skipDirs := map[string]bool{"node_modules": true, "vendor": true, ".git": true, "dist": true, "build": true}
+	var found string
+	_ = filepath.WalkDir(repoPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if d.IsDir() {
+			rel, _ := filepath.Rel(repoPath, path)
+			if rel == "." {
+				return nil
+			}
+			if strings.HasPrefix(d.Name(), ".") || skipDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			if strings.Count(rel, string(filepath.Separator)) >= 3 {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		for _, name := range names {
+			if filepath.Base(path) == name {
+				found = path
+				return filepath.SkipAll
+			}
+		}
+		return nil
+	})
+	return found
 }
 
 func (a *Adapter) Status(ctx context.Context, id string) (*orchestrator.AdapterStatus, error) {
-	return &orchestrator.AdapterStatus{}, nil
+	// docker compose ps --format json emits one JSON object per line (NDJSON).
+	// Each object has: Name, Service, State, Health fields.
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-p", id, "ps", "--format", "json", "--no-trunc")
+	out, err := cmd.Output()
+	if err != nil {
+		return &orchestrator.AdapterStatus{}, nil // project not found — return empty, not error
+	}
+
+	// Aggregate per-service counts from container rows.
+	type psRow struct {
+		Service string `json:"Service"`
+		State   string `json:"State"`   // "running", "exited", "paused", ...
+		Health  string `json:"Health"`  // "healthy", "unhealthy", "" (no healthcheck)
+	}
+	type svcAgg struct {
+		total   int
+		running int
+		healthy int
+		health  string // worst observed health label
+	}
+	agg := map[string]*svcAgg{}
+
+	for _, line := range bytes.Split(bytes.TrimSpace(out), []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var row psRow
+		if err := json.Unmarshal(line, &row); err != nil {
+			continue
+		}
+		if row.Service == "" {
+			continue
+		}
+		s, ok := agg[row.Service]
+		if !ok {
+			s = &svcAgg{health: "healthy"}
+			agg[row.Service] = s
+		}
+		s.total++
+		state := strings.ToLower(row.State)
+		if state == "running" {
+			s.running++
+		}
+		health := strings.ToLower(row.Health)
+		switch health {
+		case "unhealthy":
+			s.health = "unhealthy"
+		case "healthy":
+			// keep existing unless already unhealthy
+		case "":
+			// no healthcheck — treat running as healthy
+			if state == "running" && s.health != "unhealthy" {
+				s.health = "healthy"
+			}
+		default:
+			if s.health != "unhealthy" {
+				s.health = "unknown"
+			}
+		}
+	}
+
+	status := &orchestrator.AdapterStatus{}
+	for name, s := range agg {
+		health := s.health
+		if s.total == 0 {
+			health = "unknown"
+		} else if s.running == 0 {
+			health = "unhealthy"
+		}
+		status.Services = append(status.Services, orchestrator.ServiceStatus{
+			Name:     name,
+			Replicas: s.total,
+			Ready:    s.running,
+			Health:   health,
+		})
+	}
+	return status, nil
+}
+
+func (a *Adapter) Stop(ctx context.Context, id string) error {
+	composePath := a.resolveComposePath(id)
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composePath, "-p", id, "stop")
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	return cmd.Run()
+}
+
+func (a *Adapter) Start(ctx context.Context, id string) error {
+	composePath := a.resolveComposePath(id)
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composePath, "-p", id, "start")
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	return cmd.Run()
+}
+
+// resolveComposePath returns the compose file path for an existing stack.
+func (a *Adapter) resolveComposePath(id string) string {
+	if data, err := os.ReadFile(filepath.Join(a.workDir, id, "compose-path")); err == nil {
+		if p := strings.TrimSpace(string(data)); p != "" {
+			return p
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(a.workDir, id, "repo-path")); err == nil {
+		if p := a.findComposeFile(strings.TrimSpace(string(data))); p != "" {
+			return p
+		}
+	}
+	return filepath.Join(a.workDir, id, "docker-compose.yml")
+}
+
+// Restart restarts all running containers in the compose project.
+func (a *Adapter) Restart(ctx context.Context, id string) error {
+	composePath := a.resolveComposePath(id)
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composePath, "-p", id, "restart")
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	return cmd.Run()
+}
+
+// Down removes containers and networks but preserves named volumes and the stack entry.
+func (a *Adapter) Down(ctx context.Context, id string) error {
+	composePath := a.resolveComposePath(id)
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composePath, "-p", id, "down", "--remove-orphans")
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	return cmd.Run()
 }
 
 func (a *Adapter) Destroy(ctx context.Context, id string) error {
-	composePath := filepath.Join(a.workDir, id, "docker-compose.yml")
-	// For repo-mode stacks, find the original compose file via the pointer we wrote.
-	if data, err := os.ReadFile(filepath.Join(a.workDir, id, "repo-path")); err == nil {
-		if p := a.findComposeFile(string(data)); p != "" {
-			composePath = p
-		}
-	}
-	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composePath, "-p", id, "down", "-v")
+	composePath := a.resolveComposePath(id)
+	// -v removes named volumes; --remove-orphans cleans up containers not in the compose file.
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composePath, "-p", id, "down", "-v", "--remove-orphans")
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	return cmd.Run()
 }
+// Inspect returns detailed runtime info for one service in the compose project.
+func (a *Adapter) Inspect(ctx context.Context, stackID, service string) (*orchestrator.ServiceDetail, error) {
+	// Get container IDs for this service
+	out, err := exec.CommandContext(ctx, "docker", "compose", "-p", stackID,
+		"ps", "--service", "--filter", "service="+service, "-q").Output()
+	if err != nil || len(bytes.TrimSpace(out)) == 0 {
+		// Fallback: list all containers in project and filter by service label
+		out, err = exec.CommandContext(ctx, "docker", "ps", "-a",
+			"--filter", fmt.Sprintf("label=com.docker.compose.project=%s", stackID),
+			"--filter", fmt.Sprintf("label=com.docker.compose.service=%s", service),
+			"--format", "{{.ID}}").Output()
+		if err != nil {
+			return &orchestrator.ServiceDetail{Name: service}, nil
+		}
+	}
+
+	detail := &orchestrator.ServiceDetail{Name: service}
+	ids := strings.Fields(string(out))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		raw, err := exec.CommandContext(ctx, "docker", "inspect", id).Output()
+		if err != nil {
+			continue
+		}
+		var inspectList []map[string]interface{}
+		if json.Unmarshal(raw, &inspectList) != nil || len(inspectList) == 0 {
+			continue
+		}
+		ci := inspectList[0]
+		if detail.Image == "" {
+			detail.Image = jsonStr(ci, "Config", "Image")
+			detail.Command = jsonStr(ci, "Config", "Cmd")
+			detail.Created = jsonStr(ci, "Created")
+			detail.Env = jsonStrList(ci, "Config", "Env")
+			detail.Labels = jsonStrMap(ci, "Config", "Labels")
+			detail.Mounts = jsonMounts(ci)
+			detail.Ports = jsonPorts(ci)
+		}
+		state := jsonStr(ci, "State", "Status")
+		health := "unknown"
+		if h := jsonStr(ci, "State", "Health", "Status"); h != "" {
+			health = h
+		} else if state == "running" {
+			health = "running"
+		}
+		shortID := id
+		if len(id) > 12 {
+			shortID = id[:12]
+		}
+		name := strings.TrimPrefix(jsonStr(ci, "Name"), "/")
+		detail.Instances = append(detail.Instances, orchestrator.InstanceInfo{
+			ID:      shortID,
+			Name:    name,
+			Status:  state,
+			Health:  health,
+			Started: jsonStr(ci, "State", "StartedAt"),
+		})
+	}
+	return detail, nil
+}
+
+// Logs returns recent log lines for a service via docker compose logs.
+func (a *Adapter) Logs(ctx context.Context, stackID, service string, tail int) (string, error) {
+	if tail <= 0 {
+		tail = 100
+	}
+	composePath := a.resolveComposePath(stackID)
+	out, err := exec.CommandContext(ctx, "docker", "compose",
+		"-f", composePath, "-p", stackID,
+		"logs", "--no-color", fmt.Sprintf("--tail=%d", tail), service,
+	).Output()
+	if err != nil {
+		// Fallback to docker logs if compose file is gone
+		fallback, _ := exec.CommandContext(ctx, "docker", "logs", "--tail", fmt.Sprintf("%d", tail),
+			"--timestamps", fmt.Sprintf("%s-%s-0", stackID, service)).Output()
+		return string(fallback), nil
+	}
+	return string(out), nil
+}
+
+// LogStream opens a live-follow log stream for a service via docker compose logs --follow.
+func (a *Adapter) LogStream(ctx context.Context, stackID, service string) (io.ReadCloser, error) {
+	composePath := a.resolveComposePath(stackID)
+	cmd := exec.CommandContext(ctx, "docker", "compose",
+		"-f", composePath, "-p", stackID,
+		"logs", "--follow", "--no-color", "--tail=50", service,
+	)
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		return nil, fmt.Errorf("docker compose logs: %w", err)
+	}
+	go func() {
+		cmd.Wait() //nolint:errcheck
+		pw.Close()
+	}()
+	return pr, nil
+}
+
 func (a *Adapter) Diff(ctx context.Context, desired, actual *manifest.Stack) (*orchestrator.DiffResult, error) {
 	return &orchestrator.DiffResult{}, nil
 }
 func (a *Adapter) Rollback(ctx context.Context, id, ver string) error { return a.Destroy(ctx, id) }
+
+// --- JSON inspection helpers ---
+
+// jsonStr navigates a nested map and returns the string at the given key path.
+func jsonStr(m interface{}, keys ...string) string {
+	cur := m
+	for _, k := range keys {
+		mm, ok := cur.(map[string]interface{})
+		if !ok {
+			return ""
+		}
+		cur = mm[k]
+	}
+	if s, ok := cur.(string); ok {
+		return s
+	}
+	if cur == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v", cur)
+}
+
+// jsonStrList navigates a nested map and returns a []string at the given key path.
+func jsonStrList(m interface{}, keys ...string) []string {
+	cur := m
+	for _, k := range keys {
+		mm, ok := cur.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		cur = mm[k]
+	}
+	raw, ok := cur.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// jsonStrMap navigates a nested map and returns a map[string]string at the given key path.
+func jsonStrMap(m interface{}, keys ...string) map[string]string {
+	cur := m
+	for _, k := range keys {
+		mm, ok := cur.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		cur = mm[k]
+	}
+	raw, ok := cur.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	out := make(map[string]string, len(raw))
+	for k, v := range raw {
+		out[k] = fmt.Sprintf("%v", v)
+	}
+	return out
+}
+
+// jsonMounts extracts Mounts from a docker inspect JSON object.
+func jsonMounts(ci map[string]interface{}) []orchestrator.MountInfo {
+	mounts, ok := ci["Mounts"].([]interface{})
+	if !ok {
+		return nil
+	}
+	var out []orchestrator.MountInfo
+	for _, m := range mounts {
+		mm, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		out = append(out, orchestrator.MountInfo{
+			Type:        jsonStr(mm, "Type"),
+			Source:      jsonStr(mm, "Source"),
+			Destination: jsonStr(mm, "Destination"),
+			Mode:        jsonStr(mm, "Mode"),
+		})
+	}
+	return out
+}
+
+// jsonPorts extracts NetworkSettings.Ports from a docker inspect JSON object.
+func jsonPorts(ci map[string]interface{}) []orchestrator.PortBinding {
+	ns, ok := ci["NetworkSettings"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	portsMap, ok := ns["Ports"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	var out []orchestrator.PortBinding
+	for containerPort, bindings := range portsMap {
+		parts := strings.SplitN(containerPort, "/", 2)
+		cPort := parts[0]
+		proto := "tcp"
+		if len(parts) == 2 {
+			proto = parts[1]
+		}
+		bList, _ := bindings.([]interface{})
+		if len(bList) == 0 {
+			out = append(out, orchestrator.PortBinding{ContainerPort: cPort, Protocol: proto})
+			continue
+		}
+		for _, b := range bList {
+			bm, ok := b.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			out = append(out, orchestrator.PortBinding{
+				HostIP:        jsonStr(bm, "HostIp"),
+				HostPort:      jsonStr(bm, "HostPort"),
+				ContainerPort: cPort,
+				Protocol:      proto,
+			})
+		}
+	}
+	return out
+}

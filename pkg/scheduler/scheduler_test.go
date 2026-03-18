@@ -3,9 +3,9 @@ package scheduler_test
 import (
 	"testing"
 
-	"github.com/stratonmesh/stratonmesh/pkg/manifest"
-	"github.com/stratonmesh/stratonmesh/pkg/scheduler"
-	"github.com/stratonmesh/stratonmesh/pkg/store"
+	"github.com/selvamani/stratonmesh/pkg/manifest"
+	"github.com/selvamani/stratonmesh/pkg/scheduler"
+	"github.com/selvamani/stratonmesh/pkg/store"
 )
 
 func TestDefaultWeights(t *testing.T) {

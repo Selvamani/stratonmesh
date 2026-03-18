@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/stratonmesh/stratonmesh/pkg/manifest"
-	"github.com/stratonmesh/stratonmesh/pkg/store"
+	"github.com/selvamani/stratonmesh/pkg/manifest"
+	"github.com/selvamani/stratonmesh/pkg/store"
 	"go.uber.org/zap"
 )
 
@@ -217,11 +217,42 @@ func (e *Engine) Publish(ctx context.Context, stack *manifest.Stack, source, git
 // --- helpers ---
 
 func blueprintToStack(bp *store.Blueprint) (*manifest.Stack, error) {
-	data, err := json.Marshal(bp.Manifest)
+	if bp.Manifest == nil {
+		return &manifest.Stack{Name: bp.Name}, nil
+	}
+	// bp.Manifest may arrive in several forms depending on the code path that stored it:
+	//   1. map[string]interface{} — decoded from a JSON object by etcd client
+	//   2. string containing JSON  — stored by server via json.Marshal + string cast
+	//   3. string containing YAML  — stored by importer ParseRepoFile path
+	// Normalise all cases to []byte then try JSON then YAML.
+	var raw []byte
+	switch v := bp.Manifest.(type) {
+	case string:
+		raw = []byte(v)
+	default:
+		var err error
+		raw, err = json.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("normalise manifest: %w", err)
+		}
+	}
+
+	// Try JSON first (fastest, unambiguous).
+	var stack manifest.Stack
+	if err := json.Unmarshal(raw, &stack); err == nil && stack.Name != "" {
+		return &stack, nil
+	}
+
+	// Fall back to YAML (handles manifests stored as YAML text or
+	// the case where YAML quotes the JSON as a string literal).
+	parsed, err := manifest.Parse(raw)
 	if err != nil {
 		return nil, err
 	}
-	return manifest.Parse(data)
+	if parsed.Name == "" {
+		parsed.Name = bp.Name
+	}
+	return parsed, nil
 }
 
 // applyHandlebars replaces {{key}} style tokens in service image, command, and env.

@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/stratonmesh/stratonmesh/pkg/manifest"
+	"github.com/selvamani/stratonmesh/pkg/manifest"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )

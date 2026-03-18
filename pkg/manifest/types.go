@@ -1,6 +1,13 @@
 package manifest
 
-import "time"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
 
 // Stack is the top-level manifest representing an entire deployable unit.
 type Stack struct {
@@ -11,6 +18,12 @@ type Stack struct {
 	Strategy    DeployStrategy    `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 	Services    []Service         `yaml:"services" json:"services"`
 	Variables   map[string]string `yaml:"variables,omitempty" json:"variables,omitempty"`
+	// PortVars declares named port specifications that can be referenced across the
+	// manifest with $varname syntax. Values may be a range ("3000-3010"), a preferred
+	// port number ("8080"), or 0 / "" for auto-assignment near the container's expose port.
+	// After deployment, each portVar is resolved to a concrete port and that value is
+	// automatically injected into env vars of any service that references $varname.
+	PortVars    map[string]string `yaml:"portVars,omitempty" json:"portVars,omitempty"`
 	Metadata    Metadata          `yaml:"metadata,omitempty" json:"metadata,omitempty"`
 }
 
@@ -53,10 +66,74 @@ type Service struct {
 }
 
 // PortSpec defines a network port exposure.
+//
+// Host port resolution order (at deploy time):
+//  1. HostRange "start-end" — first available port in the range
+//  2. Host > 0              — use exactly that host port
+//  3. Host == 0 (default)   — auto-assign the next available port near Expose
+//
+// Both host and hostRange accept a portVar reference using $varname syntax:
+//
+//	hostRange: $web_port   # resolved from portVars.web_port
+//	host: $api_port        # resolved from portVars.api_port
+//
+// VarRef stores the variable name (without $) so that after allocation the
+// concrete port can be injected into env vars of any service using $varname.
 type PortSpec struct {
-	Expose   int    `yaml:"expose" json:"expose"`
-	Protocol string `yaml:"protocol,omitempty" json:"protocol,omitempty"` // tcp, udp
-	Host     int    `yaml:"host,omitempty" json:"host,omitempty"`         // explicit host port (0 = auto)
+	Expose    int    `yaml:"expose" json:"expose"`
+	Protocol  string `yaml:"protocol,omitempty" json:"protocol,omitempty"`   // tcp, udp
+	Host      int    `yaml:"host,omitempty" json:"host,omitempty"`            // explicit host port (0 = auto)
+	HostRange string `yaml:"hostRange,omitempty" json:"hostRange,omitempty"` // e.g. "8080-8090"
+	VarRef    string `yaml:"varRef,omitempty" json:"varRef,omitempty"`       // portVar name this port is bound to
+}
+
+// UnmarshalYAML allows PortSpec to accept $varname in the host: field even
+// though Host is stored as int.  When "host: $api_port" is parsed, VarRef is
+// set and Host is left at 0 (resolved later from portVars).  Similarly,
+// "hostRange: $web_port" sets VarRef and leaves HostRange as the raw string.
+func (p *PortSpec) UnmarshalYAML(value *yaml.Node) error {
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		keyNode := value.Content[i]
+		valNode := value.Content[i+1]
+		switch keyNode.Value {
+		case "expose":
+			valNode.Decode(&p.Expose) //nolint:errcheck
+		case "protocol":
+			valNode.Decode(&p.Protocol) //nolint:errcheck
+		case "varRef":
+			valNode.Decode(&p.VarRef) //nolint:errcheck
+		case "host":
+			if valNode.Tag == "!!int" {
+				valNode.Decode(&p.Host) //nolint:errcheck
+			} else {
+				// $varname or ${varname} string reference
+				var s string
+				valNode.Decode(&s) //nolint:errcheck
+				if p.VarRef == "" {
+					p.VarRef = extractVarRef(s)
+				}
+				// Host stays 0; resolved from portVars later
+			}
+		case "hostRange":
+			var s string
+			valNode.Decode(&s) //nolint:errcheck
+			if strings.HasPrefix(s, "$") {
+				if p.VarRef == "" {
+					p.VarRef = extractVarRef(s)
+				}
+				// Keep HostRange as the raw ref; resolved from portVars later
+			}
+			p.HostRange = s
+		}
+	}
+	return nil
+}
+
+// extractVarRef strips $, ${, and } from a variable reference string.
+func extractVarRef(s string) string {
+	s = strings.TrimPrefix(s, "${")
+	s = strings.TrimPrefix(s, "$")
+	return strings.TrimSuffix(s, "}")
 }
 
 // VolumeSpec defines a persistent volume.
@@ -149,6 +226,37 @@ type Metadata struct {
 	// DeployFile is a path relative to RepoPath pointing to a specific deploy file
 	// (docker-compose.yml, main.tf, Chart.yaml, etc.). Empty = auto-detect.
 	DeployFile string `yaml:"deployFile,omitempty" json:"deployFile,omitempty"`
+}
+
+// ResolveHostPort returns the host port to bind for this PortSpec.
+// It respects HostRange, Host, and falls back to Expose as the preferred port.
+// Callers should pass a portFinder func (from pkg/portalloc) to avoid an
+// import cycle; passing nil skips dynamic allocation and returns Host directly.
+func (p *PortSpec) ResolveHostPort(findPort func(preferred int) (int, error)) (int, error) {
+	if p.HostRange != "" {
+		parts := strings.SplitN(p.HostRange, "-", 2)
+		if len(parts) != 2 {
+			return 0, fmt.Errorf("invalid hostRange %q: expected start-end", p.HostRange)
+		}
+		start, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+		end, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err1 != nil || err2 != nil || start > end {
+			return 0, fmt.Errorf("invalid hostRange %q", p.HostRange)
+		}
+		if findPort == nil {
+			return start, nil
+		}
+		// Use a range-aware finder if provided, else treat start as preferred.
+		return findPort(start)
+	}
+	if p.Host > 0 {
+		return p.Host, nil
+	}
+	// Host == 0: auto-assign near the container port.
+	if findPort == nil {
+		return p.Expose, nil
+	}
+	return findPort(p.Expose)
 }
 
 // IsEnabled checks if a service is enabled (defaults to true).

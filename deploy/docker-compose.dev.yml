@@ -98,43 +98,7 @@ services:
         condition: service_healthy
       nats:
         condition: service_healthy
-
-  sm-agent-node2:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-    command: ["/bin/sm-agent"]
-    environment:
-      SM_ETCD: etcd:2379
-      SM_NATS: nats://nats:4222
-      SM_NODE_ID: node-2
-      SM_NODE_NAME: node-2
-      SM_REGION: us-east
-      SM_METRICS_ADDR: ":9091"
-    depends_on:
-      etcd:
-        condition: service_healthy
-      nats:
-        condition: service_healthy
-
-  sm-agent-node3:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-    command: ["/bin/sm-agent"]
-    environment:
-      SM_ETCD: etcd:2379
-      SM_NATS: nats://nats:4222
-      SM_NODE_ID: node-3
-      SM_NODE_NAME: node-3
-      SM_REGION: eu-west
-      SM_METRICS_ADDR: ":9091"
-    depends_on:
-      etcd:
-        condition: service_healthy
-      nats:
-        condition: service_healthy
-
+        
   dashboard:
     build:
       context: ../web

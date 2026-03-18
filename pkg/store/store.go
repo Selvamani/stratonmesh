@@ -448,6 +448,127 @@ func (s *Store) DeleteBlueprint(ctx context.Context, name string) error {
 	return nil
 }
 
+// --- Operation Events ---
+
+// OperationEvent records a lifecycle operation (deploy/start/stop/destroy/scale) for a stack.
+type OperationEvent struct {
+	ID         string    `json:"id"`
+	StackID    string    `json:"stackId"`
+	Operation  string    `json:"operation"`  // deploy, redeploy, start, stop, destroy, scale
+	Status     string    `json:"status"`     // success, failed
+	StartedAt  time.Time `json:"startedAt"`
+	FinishedAt time.Time `json:"finishedAt"`
+	DurationMs int64     `json:"durationMs"`
+	Error      string    `json:"error,omitempty"`
+	Details    string    `json:"details,omitempty"` // e.g. "service=web replicas=3"
+}
+
+// AppendEvent saves an operation event to etcd.
+func (s *Store) AppendEvent(ctx context.Context, ev OperationEvent) error {
+	ev.DurationMs = ev.FinishedAt.Sub(ev.StartedAt).Milliseconds()
+	data, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+	key := s.key("events", ev.StackID, fmt.Sprintf("%020d", ev.StartedAt.UnixNano()))
+	_, err = s.client.Put(ctx, key, string(data))
+	return err
+}
+
+// ListEvents returns the most recent N events for a specific stack (newest first).
+func (s *Store) ListEvents(ctx context.Context, stackID string, limit int) ([]OperationEvent, error) {
+	prefix := s.key("events", stackID) + "/"
+	resp, err := s.client.Get(ctx, prefix,
+		clientv3.WithPrefix(),
+		clientv3.WithSort(clientv3.SortByKey, clientv3.SortDescend),
+		clientv3.WithLimit(int64(limit)),
+	)
+	if err != nil {
+		return nil, err
+	}
+	var events []OperationEvent
+	for _, kv := range resp.Kvs {
+		var ev OperationEvent
+		if json.Unmarshal(kv.Value, &ev) == nil {
+			events = append(events, ev)
+		}
+	}
+	return events, nil
+}
+
+// ListAllEvents returns the most recent N events across all stacks (newest first).
+func (s *Store) ListAllEvents(ctx context.Context, limit int) ([]OperationEvent, error) {
+	prefix := s.key("events") + "/"
+	resp, err := s.client.Get(ctx, prefix,
+		clientv3.WithPrefix(),
+		clientv3.WithSort(clientv3.SortByKey, clientv3.SortDescend),
+		clientv3.WithLimit(int64(limit)),
+	)
+	if err != nil {
+		return nil, err
+	}
+	var events []OperationEvent
+	for _, kv := range resp.Kvs {
+		var ev OperationEvent
+		if json.Unmarshal(kv.Value, &ev) == nil {
+			events = append(events, ev)
+		}
+	}
+	return events, nil
+}
+
+// --- Snapshots ---
+//
+// Snapshot types live in pkg/snapshot; the store works with raw JSON bytes
+// to avoid import cycles. Callers in pkg/snapshot unmarshal the bytes themselves.
+
+const snapshotEtcdPrefix = "snapshots"
+
+// PutSnapshotRaw stores raw JSON bytes for a snapshot.
+// snapshotID is used as the etcd key suffix.
+func (s *Store) PutSnapshotRaw(ctx context.Context, stackID, snapshotID string, data []byte) error {
+	key := s.key(snapshotEtcdPrefix, stackID, snapshotID)
+	_, err := s.client.Put(ctx, key, string(data))
+	return err
+}
+
+// GetSnapshotRaw retrieves raw JSON bytes for a snapshot.
+func (s *Store) GetSnapshotRaw(ctx context.Context, stackID, snapshotID string) ([]byte, error) {
+	key := s.key(snapshotEtcdPrefix, stackID, snapshotID)
+	resp, err := s.client.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Kvs) == 0 {
+		return nil, fmt.Errorf("snapshot %q not found for stack %q", snapshotID, stackID)
+	}
+	return resp.Kvs[0].Value, nil
+}
+
+// ListSnapshotsRaw returns all snapshot metadata bytes for a stack (newest first).
+func (s *Store) ListSnapshotsRaw(ctx context.Context, stackID string) ([][]byte, error) {
+	prefix := s.key(snapshotEtcdPrefix, stackID) + "/"
+	resp, err := s.client.Get(ctx, prefix,
+		clientv3.WithPrefix(),
+		clientv3.WithSort(clientv3.SortByKey, clientv3.SortDescend),
+	)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([][]byte, 0, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		rows = append(rows, kv.Value)
+	}
+	return rows, nil
+}
+
+// DeleteSnapshotRaw removes snapshot metadata from etcd.
+func (s *Store) DeleteSnapshotRaw(ctx context.Context, stackID, snapshotID string) error {
+	key := s.key(snapshotEtcdPrefix, stackID, snapshotID)
+	_, err := s.client.Delete(ctx, key)
+	return err
+}
+
 // --- Generic helpers ---
 
 // CompareAndSwap performs an atomic compare-and-swap for optimistic concurrency.

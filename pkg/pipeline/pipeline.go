@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/open-policy-agent/opa/rego"
-	"github.com/stratonmesh/stratonmesh/pkg/manifest"
-	"github.com/stratonmesh/stratonmesh/pkg/store"
-	"github.com/stratonmesh/stratonmesh/pkg/telemetry"
+	"github.com/selvamani/stratonmesh/pkg/manifest"
+	"github.com/selvamani/stratonmesh/pkg/store"
+	"github.com/selvamani/stratonmesh/pkg/telemetry"
 	"go.uber.org/zap"
 )
 

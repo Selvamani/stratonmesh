@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/stratonmesh/stratonmesh/pkg/manifest"
-	"github.com/stratonmesh/stratonmesh/pkg/store"
+	"github.com/selvamani/stratonmesh/pkg/manifest"
+	"github.com/selvamani/stratonmesh/pkg/store"
 	"go.uber.org/zap"
 )
 

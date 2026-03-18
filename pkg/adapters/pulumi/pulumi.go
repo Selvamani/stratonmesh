@@ -3,10 +3,11 @@ package pulumi
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 
-	"github.com/stratonmesh/stratonmesh/pkg/manifest"
-	"github.com/stratonmesh/stratonmesh/pkg/orchestrator"
+	"github.com/selvamani/stratonmesh/pkg/manifest"
+	"github.com/selvamani/stratonmesh/pkg/orchestrator"
 	"go.uber.org/zap"
 )
 
@@ -57,4 +58,17 @@ func (a *Adapter) Destroy(ctx context.Context, id string) error { return nil }
 func (a *Adapter) Diff(ctx context.Context, d, act *manifest.Stack) (*orchestrator.DiffResult, error) {
 	return &orchestrator.DiffResult{}, nil
 }
+func (a *Adapter) Stop(ctx context.Context, id string) error    { return nil }
+func (a *Adapter) Start(ctx context.Context, id string) error   { return nil }
+func (a *Adapter) Restart(ctx context.Context, id string) error { return nil }
+func (a *Adapter) Down(ctx context.Context, id string) error    { return nil }
 func (a *Adapter) Rollback(ctx context.Context, id, v string) error { return nil }
+func (a *Adapter) Inspect(ctx context.Context, stackID, service string) (*orchestrator.ServiceDetail, error) {
+	return &orchestrator.ServiceDetail{Name: service, Platform: "pulumi"}, nil
+}
+func (a *Adapter) Logs(ctx context.Context, stackID, service string, tail int) (string, error) {
+	return "# pulumi: remote execution — logs not available locally", nil
+}
+func (a *Adapter) LogStream(_ context.Context, _, _ string) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("# pulumi: remote execution — logs not available locally\n")), nil
+}

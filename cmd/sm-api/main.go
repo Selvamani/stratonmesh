@@ -7,21 +7,21 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/stratonmesh/stratonmesh/internal/logger"
-	"github.com/stratonmesh/stratonmesh/internal/version"
-	smapi "github.com/stratonmesh/stratonmesh/pkg/api"
-	"github.com/stratonmesh/stratonmesh/pkg/adapters/docker"
-	"github.com/stratonmesh/stratonmesh/pkg/adapters/compose"
-	k8sadapter "github.com/stratonmesh/stratonmesh/pkg/adapters/kubernetes"
-	"github.com/stratonmesh/stratonmesh/pkg/adapters/terraform"
-	"github.com/stratonmesh/stratonmesh/pkg/adapters/pulumi"
-	"github.com/stratonmesh/stratonmesh/pkg/adapters/process"
-	"github.com/stratonmesh/stratonmesh/pkg/catalog"
-	"github.com/stratonmesh/stratonmesh/pkg/importer"
-	"github.com/stratonmesh/stratonmesh/pkg/orchestrator"
-	"github.com/stratonmesh/stratonmesh/pkg/pipeline"
-	"github.com/stratonmesh/stratonmesh/pkg/store"
-	"github.com/stratonmesh/stratonmesh/pkg/telemetry"
+	"github.com/selvamani/stratonmesh/internal/logger"
+	"github.com/selvamani/stratonmesh/internal/version"
+	smapi "github.com/selvamani/stratonmesh/pkg/api"
+	"github.com/selvamani/stratonmesh/pkg/adapters/docker"
+	"github.com/selvamani/stratonmesh/pkg/adapters/compose"
+	k8sadapter "github.com/selvamani/stratonmesh/pkg/adapters/kubernetes"
+	"github.com/selvamani/stratonmesh/pkg/adapters/terraform"
+	"github.com/selvamani/stratonmesh/pkg/adapters/pulumi"
+	"github.com/selvamani/stratonmesh/pkg/adapters/process"
+	"github.com/selvamani/stratonmesh/pkg/catalog"
+	"github.com/selvamani/stratonmesh/pkg/importer"
+	"github.com/selvamani/stratonmesh/pkg/orchestrator"
+	"github.com/selvamani/stratonmesh/pkg/pipeline"
+	"github.com/selvamani/stratonmesh/pkg/store"
+	"github.com/selvamani/stratonmesh/pkg/telemetry"
 )
 
 func main() {
@@ -61,7 +61,7 @@ func main() {
 	cat := catalog.New(st, log)
 
 	ver := version.Version + " (commit: " + version.GitCommit + ")"
-	srv := smapi.New(st, pl, orch, imp, cat, ver, log)
+	srv := smapi.New(st, pl, orch, imp, cat, nil, ver, log)
 
 	addr := envOr("SM_API_ADDR", ":8080")
 	httpSrv := &http.Server{

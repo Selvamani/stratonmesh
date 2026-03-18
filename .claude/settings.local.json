@@ -5,7 +5,9 @@
       "Bash(go list:*)",
       "Bash(GOPROXY=https://proxy.golang.org go list -m -versions github.com/shirou/gopsutil/v3)",
       "Bash(GOPROXY=direct go list -m -versions github.com/shirou/gopsutil/v3)",
-      "Bash(go build:*)"
+      "Bash(go build:*)",
+      "Bash(find /mnt/d/Projects/stratonmesh/web/lib -type f -name *.ts* -o -name *.js*)",
+      "Bash(npx tsc:*)"
     ]
   }
 }

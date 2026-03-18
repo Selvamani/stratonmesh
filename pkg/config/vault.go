@@ -244,23 +244,15 @@ func (m *Manager) appRoleLogin(roleID, secretID string) error {
 		"role_id":   roleID,
 		"secret_id": secretID,
 	}
-	secret, err := m.client.Auth().Login(context.Background(), &vault.MountInput{
-		Type: "approle",
-	})
-	_ = secret
+	resp, err := m.client.Logical().Write("auth/approle/login", data)
 	if err != nil {
-		// Fallback: direct write to auth/approle/login
-		resp, err2 := m.client.Logical().Write("auth/approle/login", data)
-		if err2 != nil {
-			return fmt.Errorf("approle login failed: %w (original: %v)", err2, err)
-		}
-		if resp.Auth == nil {
-			return fmt.Errorf("approle login: no auth in response")
-		}
-		m.client.SetToken(resp.Auth.ClientToken)
-		m.token = resp.Auth.ClientToken
-		return nil
+		return fmt.Errorf("approle login failed: %w", err)
 	}
+	if resp.Auth == nil {
+		return fmt.Errorf("approle login: no auth in response")
+	}
+	m.client.SetToken(resp.Auth.ClientToken)
+	m.token = resp.Auth.ClientToken
 	return nil
 }
 

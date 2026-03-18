@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,16 +12,17 @@ import (
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/stratonmesh/stratonmesh/pkg/manifest"
-	"github.com/stratonmesh/stratonmesh/pkg/store"
+	"github.com/selvamani/stratonmesh/pkg/manifest"
+	"github.com/selvamani/stratonmesh/pkg/store"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
 
 // Importer handles Git-based stack onboarding.
 type Importer struct {
-	store  *store.Store
-	logger *zap.SugaredLogger
+	store    *store.Store
+	logger   *zap.SugaredLogger
+	ReposDir string // default clone directory; overridden per-request by ImportRequest.ReposDir
 }
 
 const (
@@ -164,10 +166,13 @@ func (imp *Importer) Import(ctx context.Context, req ImportRequest) (*ImportResu
 		scanDir = filepath.Join(tmpDir, req.Path)
 	}
 
-	// Scan for recognizable formats
+	// Scan for recognizable formats — root first, then recurse into subdirs.
 	formats := imp.detectFormats(scanDir)
 	if len(formats) == 0 {
-		return nil, fmt.Errorf("no recognizable stack definition found in %s", req.GitURL)
+		formats = imp.detectFormatsDeep(scanDir, 3)
+	}
+	if len(formats) == 0 {
+		return nil, fmt.Errorf("no recognizable stack definition found in %s (checked root and subdirectories up to depth 3); try specifying a path with the 'path' field", req.GitURL)
 	}
 
 	// Pick the highest-priority format
@@ -193,6 +198,11 @@ func (imp *Importer) Import(ctx context.Context, req ImportRequest) (*ImportResu
 		}
 	}
 
+	// Compute the deploy file path relative to the repo root.
+	// If the file was found in a subdirectory (deep scan), this records exactly
+	// which file to use at deploy time so the adapter doesn't have to re-search.
+	bestRelPath, _ := filepath.Rel(tmpDir, best.FilePath)
+
 	if stack == nil {
 		imp.logger.Infow("detected format", "format", best.Format, "file", best.FilePath)
 		switch best.Format {
@@ -201,9 +211,9 @@ func (imp *Importer) Import(ctx context.Context, req ImportRequest) (*ImportResu
 		case "docker-compose":
 			stack, err = imp.parseDockerCompose(best.FilePath, req.Name)
 		case "helm":
-			stack, err = imp.parseHelmChart(scanDir)
+			stack, err = imp.parseHelmChart(filepath.Dir(best.FilePath))
 		case "kubernetes":
-			stack, err = imp.parseKubernetesManifests(scanDir)
+			stack, err = imp.parseKubernetesManifests(filepath.Dir(best.FilePath))
 		case "dockerfile":
 			stack, err = imp.parseDockerfile(best.FilePath, req.Name)
 		default:
@@ -220,6 +230,13 @@ func (imp *Importer) Import(ctx context.Context, req ImportRequest) (*ImportResu
 	}
 	if stack.Name == "" {
 		stack.Name = nameFromGitURL(req.GitURL)
+	}
+
+	// Store the detected deploy file path (relative to repo root) in metadata.
+	// This is used by the compose adapter at deploy time to locate the right file
+	// even when it lives in a subdirectory rather than the repo root.
+	if bestRelPath != "" && bestRelPath != "." {
+		stack.Metadata.DeployFile = bestRelPath
 	}
 
 	// Auto-classify workload types
@@ -243,6 +260,9 @@ func (imp *Importer) Import(ctx context.Context, req ImportRequest) (*ImportResu
 	var localPath string
 	if req.Mode == ImportModeRepo || req.Mode == ImportModeAI {
 		reposDir := req.ReposDir
+		if reposDir == "" {
+			reposDir = imp.ReposDir
+		}
 		if reposDir == "" {
 			reposDir = DefaultReposDir
 		}
@@ -357,6 +377,84 @@ func (imp *Importer) detectFormats(dir string) []DetectedFormat {
 		}
 	}
 
+	return found
+}
+
+// ParseRepoFile parses a specific deploy file from an already-cloned repo and
+// returns the resulting Stack. repoName is used as the blueprint name hint;
+// filePath is relative to repoPath.
+//
+// Supported file types: stratonmesh.yaml, docker-compose*.yml/yaml,
+// Chart.yaml (Helm), *.yaml with apiVersion/kind (Kubernetes), Dockerfile.
+//
+// Call this to preview or re-generate a manifest from any file in the repo
+// without re-cloning (the repo must already be on disk at repoPath).
+func (imp *Importer) ParseRepoFile(repoName, repoPath, filePath string) (*manifest.Stack, error) {
+	absPath := filepath.Join(repoPath, filePath)
+	if _, err := os.Stat(absPath); err != nil {
+		return nil, fmt.Errorf("file not found in repo: %s", filePath)
+	}
+	base := filepath.Base(filePath)
+	dir := filepath.Dir(absPath)
+
+	switch {
+	case base == "stratonmesh.yaml" || base == "stratonmesh.yml":
+		return imp.parseStratonMesh(absPath)
+	case strings.HasPrefix(base, "docker-compose") || strings.HasPrefix(base, "compose"):
+		if strings.HasSuffix(base, ".yml") || strings.HasSuffix(base, ".yaml") {
+			return imp.parseDockerCompose(absPath, repoName)
+		}
+	case base == "Chart.yaml":
+		return imp.parseHelmChart(dir)
+	case base == "Dockerfile" || strings.HasPrefix(base, "Dockerfile."):
+		return imp.parseDockerfile(absPath, repoName)
+	case strings.HasSuffix(base, ".yaml") || strings.HasSuffix(base, ".yml"):
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			return nil, fmt.Errorf("read file: %w", err)
+		}
+		if strings.Contains(string(data), "apiVersion:") && strings.Contains(string(data), "kind:") {
+			return imp.parseKubernetesManifests(dir)
+		}
+		return nil, fmt.Errorf("unrecognised YAML: no apiVersion/kind found in %s", filePath)
+	}
+	return nil, fmt.Errorf("unsupported deploy file format: %s", filePath)
+}
+
+// detectFormatsDeep walks the repo tree up to maxDepth levels and returns all
+// recognizable stack definitions found in any subdirectory. Directories named
+// node_modules, vendor, .git, or starting with '.' are skipped.
+// Results are sorted by priority then by path depth (shallower = better).
+func (imp *Importer) detectFormatsDeep(root string, maxDepth int) []DetectedFormat {
+	skipDirs := map[string]bool{
+		"node_modules": true, "vendor": true, ".git": true,
+		"__pycache__": true, "dist": true, "build": true, "target": true,
+	}
+	var found []DetectedFormat
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, path)
+		if rel == "." {
+			return nil
+		}
+		// Skip hidden and non-relevant dirs.
+		base := d.Name()
+		if strings.HasPrefix(base, ".") || skipDirs[base] {
+			return filepath.SkipDir
+		}
+		// Enforce depth limit.
+		depth := strings.Count(rel, string(filepath.Separator)) + 1
+		if depth > maxDepth {
+			return filepath.SkipDir
+		}
+		// Run the flat scan on this subdirectory.
+		for _, f := range imp.detectFormats(path) {
+			found = append(found, f)
+		}
+		return nil
+	})
 	return found
 }
 

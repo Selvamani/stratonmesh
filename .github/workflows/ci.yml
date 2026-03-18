@@ -111,9 +111,9 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
-          LDFLAGS="-X github.com/stratonmesh/stratonmesh/internal/version.Version=${VERSION} \
-                   -X github.com/stratonmesh/stratonmesh/internal/version.GitCommit=${GIT_COMMIT} \
-                   -X github.com/stratonmesh/stratonmesh/internal/version.BuildDate=${BUILD_DATE}"
+          LDFLAGS="-X github.com/selvamani/stratonmesh/internal/version.Version=${VERSION} \
+                   -X github.com/selvamani/stratonmesh/internal/version.GitCommit=${GIT_COMMIT} \
+                   -X github.com/selvamani/stratonmesh/internal/version.BuildDate=${BUILD_DATE}"
           EXT=""
           if [ "${{ matrix.goos }}" = "windows" ]; then EXT=".exe"; fi
           for bin in stratonmesh sm-controller sm-agent sm-api; do

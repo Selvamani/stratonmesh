@@ -1,7 +1,7 @@
 # StratonMesh — High-Level Design Document
 
-**Version:** 4.0
-**Date:** March 17, 2026
+**Version:** 4.1
+**Date:** March 18, 2026
 **Status:** Current
 
 ---
@@ -59,24 +59,35 @@ Single-node etcd and NATS for development (docker-compose.dev.yml). Production t
 
 ## 3. Implementation Status
 
-### 3.1 Implemented (Phase 1–4)
+### 3.1 Implemented (Phase 1–5)
 
 | Component | Package | Status |
 |-----------|---------|--------|
 | Manifest types, parsing, validation, topo sort | `pkg/manifest` | ✅ |
-| etcd store (state, registry, DNS, ledger, nodes, catalog) | `pkg/store` | ✅ |
+| etcd store (state, registry, DNS, ledger, nodes, catalog, events, snapshots) | `pkg/store` | ✅ |
 | Orchestrator state machine + reconciliation loop | `pkg/orchestrator` | ✅ |
+| Stack lifecycle — Stop / Start / Down / Restart | `pkg/orchestrator` | ✅ |
+| Operation event recording — deploy/stop/start/down/restart/scale/destroy | `pkg/store`, `pkg/orchestrator` | ✅ |
 | Scheduler — filter / score / bind / verify | `pkg/scheduler` | ✅ |
-| Docker adapter — full container lifecycle | `pkg/adapters/docker` | ✅ |
-| Compose adapter — generate YAML + repo build | `pkg/adapters/compose` | ✅ |
-| Kubernetes adapter — typed K8s resources, kubectl | `pkg/adapters/kubernetes` | ✅ |
+| Docker adapter — full lifecycle + Inspect/Logs | `pkg/adapters/docker` | ✅ |
+| Compose adapter — YAML gen + repo build + Inspect/Logs | `pkg/adapters/compose` | ✅ |
+| Docker Swarm adapter — full lifecycle + Inspect/Logs | `pkg/adapters/swarm` | ✅ |
+| Kubernetes adapter — typed K8s resources, kubectl + Inspect/Logs | `pkg/adapters/kubernetes` | ✅ |
 | Terraform adapter — HCL generation, AWS provider | `pkg/adapters/terraform` | ✅ |
-| COL Git importer — clone, detect, parse | `pkg/importer` | ✅ |
+| HashiCorp Nomad adapter — HCL job specs, full lifecycle | `pkg/adapters/nomad` | ✅ |
+| Apache Mesos / Marathon adapter — REST API, full lifecycle | `pkg/adapters/mesos` | ✅ |
+| Process / systemd adapter | `pkg/adapters/process` | ✅ |
+| Pulumi adapter — stubs (SDK integration pending) | `pkg/adapters/pulumi` | 🔲 |
+| COL Git importer — clone, detect, parse, deep scan | `pkg/importer` | ✅ |
 | COL AI import mode — Claude manifest generation | `pkg/importer/ai.go` | ✅ |
 | NATS JetStream telemetry bus | `pkg/telemetry` | ✅ |
 | Node agent — heartbeat, real CPU/memory metrics | `cmd/sm-agent` | ✅ |
 | Control plane server — adapter registration | `cmd/sm-controller` | ✅ |
 | REST API server — full CRUD over HTTP/JSON | `pkg/api`, `cmd/sm-api` | ✅ |
+| Service inspect/logs API — `GET /v1/stacks/{id}/services/{svc}/inspect\|logs` | `pkg/api` | ✅ |
+| Stack manifest API — `GET/PUT /v1/stacks/{id}/manifest` | `pkg/api` | ✅ |
+| Operation events API — `GET /v1/events`, `/v1/stacks/{id}/events` | `pkg/api` | ✅ |
+| Snapshot API — CRUD + restore + clone under `/v1/stacks/{id}/snapshots` | `pkg/api` | ✅ |
 | IaC 7-stage pipeline with OPA policy gate | `pkg/pipeline` | ✅ |
 | CoreDNS integration — etcd sync, watch loop | `pkg/mesh/dns` | ✅ |
 | Service registry — weighted random LB, /resolve | `pkg/mesh/registry` | ✅ |
@@ -84,8 +95,12 @@ Single-node etcd and NATS for development (docker-compose.dev.yml). Production t
 | mTLS sidecar — ECDSA CA, SPIFFE SANs, TLS 1.3 | `pkg/mesh/sidecar` | ✅ |
 | Vault secret injection — AppRole + token + cache | `pkg/config` | ✅ |
 | Blueprint size profiles + instantiation engine | `pkg/catalog` | ✅ |
+| Blueprint manifest preview/regenerate/edit API | `pkg/api` | ✅ |
 | Auto-scaler — cpu/mem/rps metrics, hysteresis | `pkg/autoscaler` | ✅ |
 | GitOps sync — GitHub/GitLab webhooks, poll loop | `pkg/gitops` | ✅ |
+| Snapshot and backup engine — MinIO, volume tar, restore, clone | `pkg/snapshot` | ✅ |
+| Port allocator — dynamic host port assignment | `pkg/portalloc` | ✅ |
+| External network auto-creation (compose external: true) | `pkg/adapters/compose` | ✅ |
 | gRPC proto definitions | `api/proto` | ✅ |
 | Web dashboard (Next.js) | `web/` | ✅ |
 | CI/CD pipeline | `.github/workflows/ci.yml` | ✅ |
@@ -101,12 +116,12 @@ Single-node etcd and NATS for development (docker-compose.dev.yml). Production t
 
 | Item | Priority | Notes |
 |------|----------|-------|
-| Snapshot and backup engine | High | `pkg/snapshot/` — needed for stateful cloning |
-| Pulumi adapter | Medium | Stub only; needs SDK integration |
-| sm-proxy binary | Medium | Stub entry point; logic lives in `pkg/mesh/proxy` |
+| Pulumi adapter — full SDK integration | High | Stubs in place; needs `pulumi/sdk` calls for `up`/`destroy` |
+| sm-proxy binary | Medium | Stub entry point; logic in `pkg/mesh/proxy`; needs wiring |
 | gRPC codegen | Medium | Run `make proto` to generate Go stubs from `.proto` |
-| Integration test suite | Medium | `test/integration/` — currently only unit tests |
-| go.sum (full tidy) | Done | Generated; keep in sync after adding dependencies |
+| Integration test suite | Medium | `test/integration/` — only unit tests currently |
+| SSE / WebSocket log streaming | Medium | Log tail is request/response; live streaming requires SSE from API |
+| In-browser terminal | Medium | `docker exec` / `kubectl exec` via WebSocket + `xterm.js` |
 | Multi-node etcd/NATS | Low | Dev uses single-node; production needs 3-node HA |
 
 ---
@@ -206,6 +221,18 @@ pending → scheduling → provisioning → deploying → verifying → running
                                        failed (parked)
 ```
 
+**Lifecycle operations from `running`:**
+
+| Operation | Transition | What changes |
+|-----------|-----------|-------------|
+| `Stop` | `running → stopping → stopped` | Containers paused (`docker stop`); volumes + etcd entry kept |
+| `Start` | `stopped → starting → running` | Containers resumed (`docker start`); no image pull |
+| `Restart` | `running → stopping → running` | Stop then Start in one atomic call; no data loss |
+| `Down` | `running → draining → down` | Containers removed (`docker compose down`); **volumes kept**; etcd entry kept; can be recovered via `Start` or `Redeploy` |
+| `Destroy` | `running → draining → deleted` | Containers removed; **volumes deleted**; etcd entry removed; irreversible |
+
+`down` is a new persistent state stored in etcd. The reconciler skips stacks in `down` state (does not attempt to re-converge them). `Start` and `Redeploy` both transition `down → running`.
+
 The reconciliation loop runs every **30 seconds** for all active stacks AND immediately on etcd watch triggers when desired state changes. For stacks in etcd that are not yet in memory (e.g. written by CLI before controller started), `reconcileAll` calls `Deploy()` to bootstrap them.
 
 ### 6.2 Scheduler (`pkg/scheduler`)
@@ -238,29 +265,37 @@ Watches cpu/memory/requestRate metrics per service. Configurable cooldown period
 ```go
 type PlatformAdapter interface {
     Name() string
-    Generate(ctx context.Context, stack *manifest.Stack) ([]byte, error)
-    Apply(ctx context.Context, stack *manifest.Stack) error
-    Status(ctx context.Context, stackID string) (*AdapterStatus, error)
-    Destroy(ctx context.Context, stackID string) error
+    Generate(ctx context.Context, stack *manifest.Stack) ([]byte, error)  // produce artifacts
+    Apply(ctx context.Context, stack *manifest.Stack) error                // deploy / converge
+    Status(ctx context.Context, stackID string) (*AdapterStatus, error)    // query running state
+    Stop(ctx context.Context, stackID string) error                        // pause containers, keep volumes
+    Start(ctx context.Context, stackID string) error                       // resume stopped stack
+    Restart(ctx context.Context, stackID string) error                     // stop + start atomically
+    Down(ctx context.Context, stackID string) error                        // remove containers, keep volumes + etcd
+    Destroy(ctx context.Context, stackID string) error                     // remove everything incl. volumes
+    Inspect(ctx context.Context, stackID, service string) (*ServiceDetail, error) // per-service runtime detail
+    Logs(ctx context.Context, stackID, service string, tail int) (string, error)  // recent log lines
     Diff(ctx context.Context, desired, actual *manifest.Stack) (*DiffResult, error)
     Rollback(ctx context.Context, stackID string, version string) error
 }
 ```
 
+`ServiceDetail` carries: `Name`, `Image`, `Platform`, `Instances []InstanceInfo`, `Ports []PortBinding`, `Env []string`, `Mounts []MountInfo`, `Labels`, `Command`, `Created`.
+
 ### 7.2 Adapter capabilities
 
 | Adapter | Status | Key behaviour |
 |---------|--------|--------------|
-| Docker | ✅ | Docker Engine SDK; containers on shared network; sequential replica names (`svc-0`, `svc-1`) |
-| Compose | ✅ | Generates `docker-compose.yml`; repo/ai mode runs `docker compose up --build -d` from local clone |
-| Kubernetes | ✅ | Generates typed K8s resources per workload archetype; `kubectl apply` |
-| Terraform | ✅ | Generates HCL targeting AWS; stateful services → managed RDS/ElastiCache |
-| Pulumi | 🔲 | Stub — TypeScript/Python programs via Pulumi SDK |
-| Process / systemd | ✅ | systemd units for bare-metal without Docker |
+| Docker | ✅ | Docker Engine SDK; containers on shared network; sequential replica names (`svc-0`, `svc-1`); full Inspect/Logs via SDK |
+| Compose | ✅ | Generates `docker-compose.yml`; repo/ai mode runs `docker compose up --build -d`; `docker compose restart` for Restart; `down` without `-v` for Down |
+| Docker Swarm | ✅ | `docker stack deploy` with overlay networks; `docker service update --force` for Restart; `docker stack rm` for Down (keeps volumes); volume prune on Destroy |
+| Kubernetes | ✅ | Generates typed K8s resources per workload archetype; `kubectl apply`; `kubectl rollout restart` for Restart; deletes Deployments/Services (keeps PVCs) for Down |
+| Terraform | ✅ | Generates HCL targeting AWS; stateful services → managed RDS/ElastiCache; lifecycle stubs for Stop/Start/Restart/Down |
+| HashiCorp Nomad | ✅ | HCL job specs; `nomad job run/stop/revert`; supports Docker, exec, Java, WASM task drivers; Down delegates to Stop (no-purge) |
+| Apache Mesos / Marathon | ✅ | Marathon REST API (`PUT/PATCH/DELETE /v2/apps`); label-based stack filtering; Stop=instances→0; Down=Stop; Destroy=DELETE app definitions |
+| Process / systemd | ✅ | systemd units for bare-metal without Docker; lifecycle stubs |
+| Pulumi | 🔲 | Stubs in place; TypeScript/Python programs via Pulumi SDK not yet wired |
 | OpenShift | 🔲 | Red Hat K8s; adds Routes, DeploymentConfigs, ImageStreams, SCCs, OAuthClient |
-| Apache Mesos / Marathon | 🔲 | Marathon REST API; maps archetypes to Marathon app definitions; ZooKeeper state |
-| Docker Swarm | 🔲 | Swarm services with placement constraints; `docker stack deploy` |
-| HashiCorp Nomad | 🔲 | HCL job specs; supports Docker, exec, Java, WASM task drivers |
 | Fly.io | 🔲 | `flyctl` CLI wrapper; machines API; regions as placement zones |
 | AWS ECS / Fargate | 🔲 | Direct ECS task definitions (not via Terraform); Fargate serverless tasks |
 | Azure Container Apps | 🔲 | Managed K8s-based platform; KEDA-driven scaling; Dapr sidecar support |
@@ -434,14 +469,16 @@ The Dockerfile uses a multi-stage build: Go 1.25 Alpine builder compiles all fiv
 ### 10.3 Key etcd paths
 
 ```
-/stratonmesh/stacks/{id}/desired     desired manifest (written by pipeline)
-/stratonmesh/stacks/{id}/actual      actual manifest (written by reconciler)
-/stratonmesh/stacks/{id}/status      lifecycle state string
+/stratonmesh/stacks/{id}/desired        desired manifest (written by pipeline)
+/stratonmesh/stacks/{id}/actual         actual manifest (written by reconciler)
+/stratonmesh/stacks/{id}/status         lifecycle state string
 /stratonmesh/services/{svc}/{stack}/{instance}   service registry endpoints
-/stratonmesh/dns/{fqdn}              DNS A records
-/stratonmesh/ledger/{stack}/{ts}     version history for rollback
-/stratonmesh/nodes/{id}              node info with 30s TTL lease
-/stratonmesh/catalog/{name}          blueprint catalog entries
+/stratonmesh/dns/{fqdn}                 DNS A records
+/stratonmesh/ledger/{stack}/{ts}        version history for rollback
+/stratonmesh/nodes/{id}                 node info with 30s TTL lease
+/stratonmesh/catalog/{name}             blueprint catalog entries
+/stratonmesh/events/{stackID}/{nanoTs}  operation audit events (padded 20-digit nano timestamp for sort)
+/stratonmesh/snapshots/{stackID}/{id}   volume snapshot metadata (JSON bytes; objects stored in MinIO)
 ```
 
 ---
@@ -465,12 +502,27 @@ The Dockerfile uses a multi-stage build: Go 1.25 Alpine builder compiles all fiv
 | Page | Path | Features |
 |------|------|---------|
 | Overview | `/` | Stack count, healthy nodes, recent activity |
-| Stacks | `/stacks` | List with status badges, deploy button |
-| Stack detail | `/stacks/{id}` | Services, replica bars, deployment history, rollback, destroy, manifest editor |
-| Catalog | `/catalog` | Blueprint cards, import modal (Catalog / Repo / AI modes), deploy modal with platform + file picker, size profiles, open in Code-Server |
+| Stacks | `/stacks` | List with status badges; per-row Restart / Stop / Down / Start / Destroy actions |
+| Stack detail | `/stacks/{id}` | Services card with **Logs**, **Inspect**, **Scale** buttons per service; Operation History card; Snapshots card (create/restore/clone/delete); Deployment History (ledger); stack actions (Redeploy, Restart, Stop, Start, Down, Rollback, Destroy); Manifest Editor modal |
+| Catalog | `/catalog` | Blueprint cards, import modal (Catalog / Repo / AI modes), deploy modal with platform + file picker, size profiles, open in Code-Server, manifest preview/edit/regenerate |
 | Nodes | `/nodes` | Per-node CPU/memory bars, provider badges, last-seen |
+| Reports | `/reports` | Operation audit log across all stacks; summary stat cards (total/success/failed); color-coded operation badges; stack deep-link; auto-refreshes every 10 s |
 
-### 12.2 API surface (Next.js route handlers)
+### 12.2 Service inspect drawer
+
+Clicking **Inspect** or **Logs** on any service row opens a right-side panel with five tabs:
+
+| Tab | Content |
+|-----|---------|
+| Overview | Image, command, created timestamp; instances table (ID, status, health, node) |
+| Ports | Host→container port mapping table |
+| Env | Environment variable list |
+| Mounts | Volume/bind mount table (type, source, destination) |
+| Logs | Last N lines selector (100/200/500/1000), Refresh button, monospace log output |
+
+Clicking **Logs** opens the drawer directly on the Logs tab. A dim overlay behind the drawer closes it on click.
+
+### 12.3 API surface (Next.js route handlers)
 
 All dashboard API calls proxy to `http://sm-controller:8080` (internal Docker network). Environment variable `SM_API_URL` controls the upstream.
 
@@ -478,112 +530,127 @@ All dashboard API calls proxy to `http://sm-controller:8080` (internal Docker ne
 
 ## 13. Next Steps
 
+### Completed ✅
+
+The following items have been implemented and shipped across Phase 1–5:
+
+1. ✅ **Snapshot and backup engine** (`pkg/snapshot/`) — MinIO S3-compatible storage, Create/Restore/Clone/List/Delete operations, snapshot card in stack detail UI. Scheduled backup cron expression stored per service in the manifest.
+
+2. ✅ **Docker Swarm adapter** (`pkg/adapters/swarm/`) — `docker stack deploy` with overlay networks, `docker service scale` for stop/start, swarm service definitions with `replicas:` and placement constraints, registered as platform `"swarm"`.
+
+3. ✅ **HashiCorp Nomad adapter** (`pkg/adapters/nomad/`) — HCL job specifications, service/batch/system job type mapping per archetype, Consul-based service discovery integration.
+
+4. ✅ **Apache Mesos / Marathon adapter** (`pkg/adapters/mesos/`) — Marathon REST API, persistent volumes for stateful services, constraint expressions (`[["hostname","UNIQUE"]]`) for placement, ZooKeeper leader detection.
+
+5. ✅ **Stack Down/Restart lifecycle** — `Down` removes containers but preserves volumes and the etcd entry (`down` state, recoverable via Start/Redeploy); `Restart` is an atomic stop+start. Both are first-class lifecycle states with etcd persistence, REST endpoints (`POST /v1/stacks/{id}/down|restart`), and UI buttons. All adapters (Docker, Compose, K8s, Swarm, Nomad) implement `Down()` and `Restart()`.
+
+6. ✅ **Per-container logs and inspect** — Service inspect drawer in the stack detail page with five tabs: Overview (image, platform, replicas, command, created), Ports, Env, Mounts, and Logs. Live log tail via `GET /v1/stacks/{id}/services/{svc}/logs`. Container inspect via `GET /v1/stacks/{id}/services/{svc}/inspect` returning `ServiceDetail`.
+
+7. ✅ **Operation events and audit trail** — `OperationEvent` type persisted at `/stratonmesh/events/{stackID}/{nanoTs}` in etcd. Every lifecycle operation (deploy, stop, start, restart, down, destroy, scale, rollback) records an event with timestamp, operator, and outcome. Events API: `GET /v1/stacks/{id}/events`.
+
+8. ✅ **Reports page** (`web/app/reports/`) — Full audit log dashboard at `/reports`, color-coded operation badges, stack/service filter, 10-second auto-refresh. Sources from the operation events API.
+
+9. ✅ **Port allocator** (`pkg/portalloc/`) — `FindAvailable(preferred)` and `FindInRange(start, end)` for dynamic host port assignment. `PortSpec.HostRange` manifest field (`hostRange: "8080-8090"`); `ResolveHostPort()` method used by adapters.
+
+10. ✅ **Blueprint manifest preview, edit, and regenerate** — `GET/POST /v1/catalog/{name}/manifest` returns/regenerates YAML from stored blueprint; `PUT` saves user-edited YAML back to catalog. Deploy modal includes Edit and Preview tabs with platform injected into the preview render.
+
+11. ✅ **Deep repo scanning** — `detectFormatsDeep()` recursive scan up to depth 3 for repos with non-root compose files (e.g. Jitsi Meet). `SM_REPOS_DIR` env var for custom clone directory with three-tier fallback: per-request → env var → hardcoded default.
+
+---
+
 ### Priority 1 — Core stability
 
-1. **Snapshot and backup engine** (`pkg/snapshot/`)
-   Stateful volume snapshots stored in MinIO. Enables: stack cloning, disaster recovery, preview environment branching. Required for production readiness of stateful workloads.
-
-2. **gRPC codegen**
+1. **gRPC codegen**
    Run `make proto` to generate Go stubs from `api/proto/stratonmesh.proto`. Wire StackService, CatalogService, and NodeService handlers. Enables SDK consumers and CLI to use gRPC instead of REST.
 
-3. **Integration test suite** (`test/integration/`)
+2. **Integration test suite** (`test/integration/`)
    Tests that spin up etcd + NATS in CI and exercise the full pipeline → orchestrator → adapter chain. Currently only unit tests exist.
+
+3. ✅ **SSE log streaming** — `GET /v1/stacks/{id}/services/{svc}/logs/stream` returns `text/event-stream`. Each log line emitted as `data: <line>\n\n`. Docker adapter uses `ContainerLogs(Follow: true)` + stdcopy pipe; Compose adapter uses `docker compose logs --follow`; K8s adapter uses `kubectl logs --follow`; Swarm uses `docker service logs --follow`. Frontend Logs tab opens `EventSource` on mount, streams live with ▶ Stream / ■ Stop controls; snapshot buttons (100/200/500 lines) still available for one-shot fetches.
 
 ### Priority 2 — New Platform Adapters
 
-4. **OpenShift adapter** (`pkg/adapters/openshift/`)
+4. **Pulumi adapter** (`pkg/adapters/pulumi/`)
+   Generate TypeScript or Python programs using Pulumi SDKs. Implement the full `PlatformAdapter` interface. Currently stub only. Useful for cloud-native stacks targeting AWS/GCP/Azure with programmatic conditionals and loops.
+
+5. **OpenShift adapter** (`pkg/adapters/openshift/`)
    Red Hat OpenShift extends Kubernetes with Routes (ingress), DeploymentConfigs, ImageStreams, BuildConfigs, and Security Context Constraints (SCCs). The adapter generates OpenShift-native YAML, creates Routes instead of Ingresses, handles the stricter SCC defaults (no root containers), and authenticates via `oc login` token or service account kubeconfig.
 
-5. **Apache Mesos / Marathon adapter** (`pkg/adapters/mesos/`)
-   Translates StratonMesh archetypes to Marathon application definitions (JSON). Long-running services become persistent Marathon apps with health check URLs. Batch jobs become one-off tasks. Stateful services use Marathon storage persistent volumes. Placement uses constraint expressions (`[["hostname", "UNIQUE"]]` for daemons). State discovery via the Marathon REST API; ZooKeeper used for leader election detection.
-
-6. **Docker Swarm adapter** (`pkg/adapters/swarm/`)
-   Generates a `docker-stack.yml` and applies it via `docker stack deploy`. Swarm services with `replicas:`, placement constraints, and named overlay networks. Secrets managed via `docker secret`. Useful for existing Swarm clusters before migration to Compose or K8s.
-
-7. **HashiCorp Nomad adapter** (`pkg/adapters/nomad/`)
-   Generates HCL job specifications. Nomad's multi-driver support (Docker, exec, Java, WASM) maps cleanly to StratonMesh archetypes. Service jobs → long-running; batch jobs → batch/scheduled; system jobs → daemon. Nomad's built-in service discovery integrates with the COL service registry via Consul.
-
-8. **Pulumi adapter** (`pkg/adapters/pulumi/`)
-   Generate TypeScript or Python programs using Pulumi SDKs. Implement the full `PlatformAdapter` interface. Useful for cloud-native stacks targeting AWS/GCP/Azure with programmatic conditionals and loops.
-
-9. **Cloud-native serverless adapters**
+6. **Cloud-native serverless adapters**
    - **AWS ECS/Fargate** — direct ECS task definition generation (not via Terraform); faster iteration than Terraform for container-only workloads
    - **Azure Container Apps** — KEDA-driven scaling rules, Dapr sidecar annotations, managed certificates
    - **Google Cloud Run** — min/max instance bounds, VPC connector for private mesh, IAM invoker bindings
 
 ### Priority 3 — Capabilities
 
-10. **sm-proxy binary** (`cmd/sm-proxy/`)
-    Wire `pkg/mesh/proxy` into a standalone process. Enables running the smart proxy independently of the controller (e.g. on edge nodes or as a sidecar injection target).
+7. **sm-proxy binary** (`cmd/sm-proxy/`)
+   Wire `pkg/mesh/proxy` into a standalone process. Enables running the smart proxy independently of the controller (e.g. on edge nodes or as a sidecar injection target).
 
-11. **Live discovery import**
-    Connect to a running Docker host or Kubernetes cluster via Docker socket / kubeconfig, enumerate running containers/pods, reverse-engineer service topology from network connections and environment variables, and generate a blueprint. Enables brownfield migration — bring unmanaged applications under StratonMesh with zero rewriting.
+8. **In-browser terminal**
+   `xterm.js` + WebSocket → `docker exec` / `kubectl exec` for interactive shell access to a running container from the stack detail page. Complements the existing Logs tab in the service inspect drawer.
 
-12. **Deploy file selector per instantiation**
+9. **Live discovery import**
+   Connect to a running Docker host or Kubernetes cluster via Docker socket / kubeconfig, enumerate running containers/pods, reverse-engineer service topology from network connections and environment variables, and generate a blueprint. Enables brownfield migration — bring unmanaged applications under StratonMesh with zero rewriting.
+
+10. **Deploy file selector per instantiation**
     Allow users to pick a specific compose/terraform/k8s file from within a cloned repo at instantiate time (UI + API). `DeployFile` field stored in `manifest.Metadata`; compose adapter uses it instead of auto-detection.
 
-13. **Environment promotion pipeline**
+11. **Environment promotion pipeline**
     First-class `dev → staging → production` promotion: copy desired state from one environment to another with a single command, gate on policy approval, preserve secrets references. Dashboard shows promotion status across environments per stack.
 
-14. **Blue-green and canary deployment UI**
+12. **Blue-green and canary deployment UI**
     Visual wizard in the dashboard to configure traffic split percentages, header-forced canary routing, automated rollback triggers (error rate threshold), and step-up schedules. Currently the proxy supports the mechanics; the UX is missing.
 
-15. **Multi-tenancy and RBAC**
+13. **Multi-tenancy and RBAC**
     Namespace isolation per team/project. Role-based access control: admin, deployer, viewer roles per namespace. etcd prefix isolation (`/stratonmesh/{tenant}/...`). API token or OIDC/SSO authentication. Audit log per tenant.
-
-16. **Real-time log streaming and terminal**
-    Dashboard: live log tail per service (SSE from sm-api → Docker logs / kubectl logs). In-browser terminal (`xterm.js` + WebSocket → `docker exec` / `kubectl exec`). Required for debugging deployed services without leaving the UI.
 
 ### Priority 4 — Scale and Operations
 
-17. **Multi-node etcd and NATS**
+14. **Multi-node etcd and NATS**
     Production HA setup: 3-node etcd cluster, 3-node NATS with JetStream replication (R=3). Add cluster bootstrap scripts and health checks to `deploy/`. Etcd learner nodes for read-scale.
 
-18. **Drift detection and auto-revert**
-    Reconciler currently converges on desired state but does not detect drift (actual state diverging without a desired state change change). Add: compare actual vs desired on each tick; emit `drift.detected` NATS event; configurable policy per environment (`warn` for dev, `revert` for production).
+15. **Drift detection and auto-revert**
+    Reconciler currently converges on desired state but does not detect drift (actual state diverging without a desired state change). Add: compare actual vs desired on each tick; emit `drift.detected` NATS event; configurable policy per environment (`warn` for dev, `revert` for production).
 
-19. **Horizontal orchestrator scaling**
+16. **Horizontal orchestrator scaling**
     Multiple controller instances with etcd-based leader election. Each instance owns a hash-partitioned slice of the stack namespace. Required when managing 1,000+ concurrent stacks. Scheduler uses consistent hashing to avoid double-scheduling.
 
-20. **Cost projection and budget enforcement**
+17. **Cost projection and budget enforcement**
     Per-stack cost tracking: node `cost_per_hour` × resource allocation fraction. Real-time cost display in dashboard. Pipeline stage 5 OPA rule blocks deploys that exceed per-namespace budget thresholds. Monthly cost reports via email/Slack.
 
-21. **Snapshot and backup engine** (`pkg/snapshot/`)
-    Stateful volume snapshots stored in MinIO via S3 API. Scheduled backups per service (cron expression in manifest). Point-in-time restore. Stack cloning (duplicate a running stack to a new name). Cross-region replication for disaster recovery.
-
-22. **Multi-cluster federation**
+18. **Multi-cluster federation**
     Deploy a single stack across multiple clusters/regions. Global scheduler selects the target cluster per service based on latency, cost, and compliance zone. Cross-cluster service mesh: services in cluster A resolve cluster B endpoints via DNS. Federated state in a global etcd tier.
 
-23. **GPU workload scheduling**
+19. **GPU workload scheduling**
     Node agent reports GPU availability (NVIDIA/AMD) via nvml. Scheduler filter phase: reject nodes without requested GPU type. Score phase: prefer nodes with fractional GPU availability. Manifest field: `resources.gpu: "1"`. Maps to Docker `--gpus`, K8s `nvidia.com/gpu` resource limits, and Nomad device fingerprinter.
 
-24. **Windows and ARM64 node support**
+20. **Windows and ARM64 node support**
     sm-agent cross-compiles to `windows/amd64` and `linux/arm64`. Windows nodes use Windows containers or WSL2-backed Docker. ARM64 nodes use native Docker (Raspberry Pi, AWS Graviton, Apple M-series in Linux VMs). Multi-arch image builds via `docker buildx` in the Compose adapter.
 
-25. **SSO / OAuth2 / OIDC dashboard authentication**
+21. **SSO / OAuth2 / OIDC dashboard authentication**
     Replace the current open dashboard with configurable OIDC provider (Keycloak, Google, GitHub, Okta). Token issued at login, passed as `Authorization: Bearer` to the API. Roles mapped from OIDC claims. Required for any multi-user or production deployment.
 
-26. **Compliance and policy profiles**
+22. **Compliance and policy profiles**
     Pre-built OPA policy bundles for common compliance frameworks: SOC 2 (audit logging, encryption at rest), HIPAA (no PHI in env vars, volume encryption), PCI-DSS (network isolation, no public ports). Selectable per namespace. Dashboard shows compliance score per stack.
 
-27. **Webhook and notification integrations**
+23. **Webhook and notification integrations**
     NATS event → webhook fan-out for: deploy success/failure, drift detected, auto-scale events, cost threshold breach, policy denial. Built-in targets: Slack, Microsoft Teams, PagerDuty, generic HTTP. Configurable per namespace in dashboard.
 
 ### Priority 5 — AI and Intelligence
 
-28. **AI-assisted manifest refinement**
+24. **AI-assisted manifest refinement**
     After AI import, offer an interactive chat panel in the dashboard: users type "add a Redis cache service" or "set app to 3 replicas with 512Mi memory" and Claude rewrites the manifest. Changes are diffed and previewed before applying.
 
-29. **Anomaly detection and predictive scaling**
+25. **Anomaly detection and predictive scaling**
     Claude analyses rolling metric windows from VictoriaMetrics: flag unusual CPU/memory patterns, predict traffic spikes from historical cycles, suggest adjusted auto-scaler thresholds. Recommendations surfaced as actionable cards in the dashboard with one-click apply.
 
-30. **Natural language deploy**
+26. **Natural language deploy**
     CLI: `stratonmesh deploy --from "deploy nextcloud with PostgreSQL and S3-compatible storage, sized for 500 users"` — Claude selects or generates the blueprint and parameters, shows a plan for approval, then deploys. Enables non-expert users to deploy complex stacks.
 
-31. **AI ops assistant**
+27. **AI ops assistant**
     Conversational interface in the dashboard for operational queries: "Why is the voting-app in failed state?", "Which service is consuming the most memory?", "Show me the deployment history for nextcloud". Claude is given read access to etcd state, NATS events, and metric aggregates to answer in natural language.
 
-32. **Smart blueprint marketplace**
+28. **Smart blueprint marketplace**
     Community-contributed blueprints with AI-generated tags, descriptions, and compatibility scores. Claude reviews incoming blueprints for security issues (hardcoded secrets, privileged containers, exposed admin ports) before publication. Semantic search: "find a blueprint similar to my docker-compose" using embedding similarity.
 
 ---

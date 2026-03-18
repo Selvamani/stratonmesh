@@ -5,7 +5,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/stratonmesh/stratonmesh/internal/logger"
+	"github.com/selvamani/stratonmesh/internal/logger"
 )
 
 func main() {

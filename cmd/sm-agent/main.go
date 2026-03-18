@@ -14,9 +14,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
-	"github.com/stratonmesh/stratonmesh/internal/logger"
-	"github.com/stratonmesh/stratonmesh/pkg/store"
-	"github.com/stratonmesh/stratonmesh/pkg/telemetry"
+	"github.com/selvamani/stratonmesh/internal/logger"
+	"github.com/selvamani/stratonmesh/pkg/store"
+	"github.com/selvamani/stratonmesh/pkg/telemetry"
 )
 
 func main() {

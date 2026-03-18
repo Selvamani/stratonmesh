@@ -13,9 +13,11 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
-	"github.com/stratonmesh/stratonmesh/pkg/manifest"
-	"github.com/stratonmesh/stratonmesh/pkg/orchestrator"
+	"github.com/selvamani/stratonmesh/pkg/manifest"
+	"github.com/selvamani/stratonmesh/pkg/orchestrator"
+	"github.com/selvamani/stratonmesh/pkg/portalloc"
 	"go.uber.org/zap"
 )
 
@@ -77,6 +79,23 @@ func (a *Adapter) Generate(ctx context.Context, stack *manifest.Stack) ([]byte, 
 
 // Apply executes the deployment — creates network, volumes, and containers.
 func (a *Adapter) Apply(ctx context.Context, stack *manifest.Stack) error {
+	// Allocate dynamic ports declared via portVars.
+	if len(stack.PortVars) > 0 {
+		resolved, err := manifest.AllocatePorts(stack, func(start, end int) (int, error) {
+			if end > start {
+				return portalloc.FindInRange(start, end)
+			}
+			return portalloc.FindAvailable(start)
+		})
+		if err != nil {
+			return fmt.Errorf("allocate ports: %w", err)
+		}
+		manifest.InjectResolvedPorts(stack, resolved)
+		if len(resolved) > 0 {
+			a.logger.Infow("port vars resolved", "stack", stack.Name, "ports", resolved)
+		}
+	}
+
 	netName := fmt.Sprintf("%s-net", stack.Name)
 
 	// Create network (idempotent)
@@ -167,6 +186,79 @@ func (a *Adapter) Status(ctx context.Context, stackID string) (*orchestrator.Ada
 	return &orchestrator.AdapterStatus{Services: services}, nil
 }
 
+// Stop pauses all containers in a stack (preserves volumes).
+func (a *Adapter) Stop(ctx context.Context, stackID string) error {
+	containers, err := a.client.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return err
+	}
+	prefix := stackID + "-"
+	timeout := 30
+	for _, c := range containers {
+		for _, name := range c.Names {
+			if strings.HasPrefix(strings.TrimPrefix(name, "/"), prefix) {
+				if err := a.client.ContainerStop(ctx, c.ID, container.StopOptions{Timeout: &timeout}); err != nil {
+					a.logger.Warnw("stop container error", "container", name, "error", err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Start resumes all stopped containers in a stack.
+func (a *Adapter) Start(ctx context.Context, stackID string) error {
+	containers, err := a.client.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return err
+	}
+	prefix := stackID + "-"
+	for _, c := range containers {
+		for _, name := range c.Names {
+			if strings.HasPrefix(strings.TrimPrefix(name, "/"), prefix) {
+				if c.State != "running" {
+					if err := a.client.ContainerStart(ctx, c.ID, container.StartOptions{}); err != nil {
+						a.logger.Warnw("start container error", "container", name, "error", err)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Restart stops then starts all containers in the stack, preserving volumes.
+func (a *Adapter) Restart(ctx context.Context, stackID string) error {
+	if err := a.Stop(ctx, stackID); err != nil {
+		return err
+	}
+	return a.Start(ctx, stackID)
+}
+
+// Down removes containers and networks for a stack but preserves named volumes.
+func (a *Adapter) Down(ctx context.Context, stackID string) error {
+	containers, err := a.client.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return err
+	}
+	prefix := stackID + "-"
+	timeout := 30
+	for _, c := range containers {
+		for _, name := range c.Names {
+			name = strings.TrimPrefix(name, "/")
+			if strings.HasPrefix(name, prefix) {
+				a.client.ContainerStop(ctx, c.ID, container.StopOptions{Timeout: &timeout})
+				// RemoveVolumes: false — keep named volumes intact
+				a.client.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true, RemoveVolumes: false})
+				a.logger.Infow("container removed (down)", "name", name)
+			}
+		}
+	}
+	netName := fmt.Sprintf("%s-net", stackID)
+	a.client.NetworkRemove(ctx, netName)
+	return nil
+}
+
 // Destroy removes all containers, volumes, and networks for a stack.
 func (a *Adapter) Destroy(ctx context.Context, stackID string) error {
 	containers, err := a.client.ContainerList(ctx, container.ListOptions{All: true})
@@ -175,14 +267,30 @@ func (a *Adapter) Destroy(ctx context.Context, stackID string) error {
 	}
 
 	prefix := stackID + "-"
+	volumeSet := map[string]struct{}{}
+	timeout := 30
 	for _, c := range containers {
 		for _, name := range c.Names {
 			name = strings.TrimPrefix(name, "/")
 			if strings.HasPrefix(name, prefix) {
-				timeout := 30 // seconds
 				a.client.ContainerStop(ctx, c.ID, container.StopOptions{Timeout: &timeout})
-				a.client.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true})
+				a.client.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+				// Collect anonymous volumes for explicit removal
+				for _, m := range c.Mounts {
+					if m.Name != "" {
+						volumeSet[m.Name] = struct{}{}
+					}
+				}
 				a.logger.Infow("container removed", "name", name)
+			}
+		}
+	}
+
+	// Remove named volumes that belonged to this stack
+	for volName := range volumeSet {
+		if strings.HasPrefix(volName, stackID+"-") {
+			if err := a.client.VolumeRemove(ctx, volName, true); err != nil {
+				a.logger.Warnw("volume remove error", "volume", volName, "error", err)
 			}
 		}
 	}
@@ -192,6 +300,160 @@ func (a *Adapter) Destroy(ctx context.Context, stackID string) error {
 	a.client.NetworkRemove(ctx, netName)
 
 	return nil
+}
+
+// Inspect returns detailed runtime info for one service.
+func (a *Adapter) Inspect(ctx context.Context, stackID, service string) (*orchestrator.ServiceDetail, error) {
+	containers, err := a.client.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return nil, err
+	}
+	prefix := fmt.Sprintf("%s-%s-", stackID, service)
+	detail := &orchestrator.ServiceDetail{Name: service}
+
+	for _, c := range containers {
+		for _, name := range c.Names {
+			name = strings.TrimPrefix(name, "/")
+			if !strings.HasPrefix(name, prefix) {
+				continue
+			}
+			// Full inspect for the first matching container (to get image, env, mounts, etc.)
+			if detail.Image == "" {
+				info, _, err := a.client.ContainerInspectWithRaw(ctx, c.ID, false)
+				if err == nil {
+					detail.Image = info.Config.Image
+					detail.Command = strings.Join(info.Config.Cmd, " ")
+					detail.Created = info.Created
+					detail.Env = info.Config.Env
+					detail.Labels = info.Config.Labels
+					for _, m := range info.Mounts {
+						detail.Mounts = append(detail.Mounts, orchestrator.MountInfo{
+							Type:        string(m.Type),
+							Source:      m.Source,
+							Destination: m.Destination,
+							Mode:        m.Mode,
+						})
+					}
+					for cp, bindings := range info.HostConfig.PortBindings {
+						for _, hb := range bindings {
+							proto := cp.Proto()
+							if proto == "" {
+								proto = "tcp"
+							}
+							detail.Ports = append(detail.Ports, orchestrator.PortBinding{
+								HostIP:        hb.HostIP,
+								HostPort:      hb.HostPort,
+								ContainerPort: cp.Port(),
+								Protocol:      proto,
+							})
+						}
+					}
+				}
+			}
+			status := c.State
+			health := "unknown"
+			if c.Status != "" {
+				if strings.Contains(c.Status, "healthy") {
+					health = "healthy"
+				} else if strings.Contains(c.Status, "unhealthy") {
+					health = "unhealthy"
+				} else if c.State == "running" {
+					health = "running"
+				}
+			}
+			detail.Instances = append(detail.Instances, orchestrator.InstanceInfo{
+				ID:      c.ID[:12],
+				Name:    name,
+				Status:  status,
+				Health:  health,
+				Started: c.Status,
+			})
+		}
+	}
+	return detail, nil
+}
+
+// Logs returns recent log lines for a service.
+func (a *Adapter) Logs(ctx context.Context, stackID, service string, tail int) (string, error) {
+	if tail <= 0 {
+		tail = 100
+	}
+	containers, err := a.client.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return "", err
+	}
+	prefix := fmt.Sprintf("%s-%s-", stackID, service)
+	var allLogs strings.Builder
+	for _, c := range containers {
+		for _, name := range c.Names {
+			name = strings.TrimPrefix(name, "/")
+			if !strings.HasPrefix(name, prefix) {
+				continue
+			}
+			tailStr := fmt.Sprintf("%d", tail)
+			opts := container.LogsOptions{
+				ShowStdout: true,
+				ShowStderr: true,
+				Tail:       tailStr,
+				Timestamps: true,
+			}
+			rc, err := a.client.ContainerLogs(ctx, c.ID, opts)
+			if err != nil {
+				continue
+			}
+			var buf strings.Builder
+			io.Copy(&buf, rc)
+			rc.Close()
+			if allLogs.Len() > 0 {
+				allLogs.WriteString(fmt.Sprintf("\n--- %s ---\n", name))
+			}
+			allLogs.WriteString(buf.String())
+		}
+	}
+	return allLogs.String(), nil
+}
+
+// LogStream opens a live-follow log stream for a service via the Docker SDK.
+// The stream is demultiplexed from Docker's header format via stdcopy.
+func (a *Adapter) LogStream(ctx context.Context, stackID, service string) (io.ReadCloser, error) {
+	containers, err := a.client.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return nil, err
+	}
+	prefix := fmt.Sprintf("%s-%s-", stackID, service)
+	var containerID string
+	for _, c := range containers {
+		for _, name := range c.Names {
+			if strings.HasPrefix(strings.TrimPrefix(name, "/"), prefix) {
+				containerID = c.ID
+				break
+			}
+		}
+		if containerID != "" {
+			break
+		}
+	}
+	if containerID == "" {
+		return nil, fmt.Errorf("no container found for service %q in stack %q", service, stackID)
+	}
+	raw, err := a.client.ContainerLogs(ctx, containerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     true,
+		Timestamps: true,
+		Tail:       "50",
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Docker SDK returns a multiplexed stream; demux stdout+stderr into a single pipe.
+	pr, pw := io.Pipe()
+	go func() {
+		stdcopy.StdCopy(pw, pw, raw) //nolint:errcheck
+		raw.Close()
+		pw.Close()
+	}()
+	return pr, nil
 }
 
 // Diff compares desired state against running containers.

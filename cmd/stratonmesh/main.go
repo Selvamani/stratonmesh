@@ -10,13 +10,13 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
-	"github.com/stratonmesh/stratonmesh/internal/logger"
-	"github.com/stratonmesh/stratonmesh/internal/version"
-	"github.com/stratonmesh/stratonmesh/pkg/adapters/docker"
-	"github.com/stratonmesh/stratonmesh/pkg/importer"
-	"github.com/stratonmesh/stratonmesh/pkg/manifest"
-	"github.com/stratonmesh/stratonmesh/pkg/orchestrator"
-	"github.com/stratonmesh/stratonmesh/pkg/store"
+	"github.com/selvamani/stratonmesh/internal/logger"
+	"github.com/selvamani/stratonmesh/internal/version"
+	"github.com/selvamani/stratonmesh/pkg/adapters/docker"
+	"github.com/selvamani/stratonmesh/pkg/importer"
+	"github.com/selvamani/stratonmesh/pkg/manifest"
+	"github.com/selvamani/stratonmesh/pkg/orchestrator"
+	"github.com/selvamani/stratonmesh/pkg/store"
 )
 
 var log = logger.New("development")

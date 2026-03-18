@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package stratonmesh.v1;
 
-option go_package = "github.com/stratonmesh/stratonmesh/api/gen/stratonmesh/v1;stratonmeshv1";
+option go_package = "github.com/selvamani/stratonmesh/api/gen/stratonmesh/v1;stratonmeshv1";
 
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/empty.proto";
